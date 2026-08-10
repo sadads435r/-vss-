@@ -16,6 +16,13 @@ __pycache__/
 deploy/docker/resolved.yml
 deploy/docker/rag-secret.override.yml
 
+# Office assistant local configuration, credentials, certificates, and data
+/.env
+/config/office-config.yaml
+/data/office-assistant/
+/deploy/docker/office-assistant/caddy-data/
+/deploy/docker/office-assistant/caddy-config/
+
 *.log
 *checkpoint.*
 .orchestrator-artifacts/*

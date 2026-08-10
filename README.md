@@ -1,5 +1,7 @@
 <h2>NVIDIA AI Blueprint: Video Search and Summarization (VSS)</h2>
 
+> DGX Spark 智能办公助手扩展请参阅 [docs/OFFICE_ASSISTANT.md](docs/OFFICE_ASSISTANT.md)。
+
 **Build GPU-accelerated video AI agents that search, analyze, summarize, and reason over live or recorded video using natural language.**
 
 NVIDIA AI Blueprint for Video Search and Summarization (VSS) combines vision-language models, RAG, and NVIDIA NIM microservices to deliver real-time video analytics, visual Q&A, alert verification, clip retrieval, and long-video summarization.

@@ -1,0 +1,12 @@
+logLevel: info
+rtsp: yes
+rtspAddress: :8554
+api: yes
+apiAddress: 127.0.0.1:9997
+metrics: yes
+metricsAddress: 127.0.0.1:9998
+
+paths:
+  all_others:
+    source: publisher
+    sourceOnDemand: no

@@ -1,0 +1,13 @@
+{
+  "version": "1.0",
+  "alerts": [
+    {
+      "alert_type": "FOV Count Violation",
+      "output_category": "Office Presence Alert",
+      "prompts": {
+        "system": "You verify anonymous office safety events. Never identify a person or infer sensitive attributes.",
+        "user": "Is at least one real person visibly present in the office scene? Ignore posters, photographs, monitors, and reflections. Answer yes or no, followed by one short reason."
+      }
+    }
+  ]
+}

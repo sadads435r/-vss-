@@ -1,0 +1,19 @@
+:{$OFFICE_HTTPS_PORT} {
+    tls internal
+
+    basic_auth {
+        {$OFFICE_USERNAME} {$OFFICE_PASSWORD_HASH}
+    }
+
+    handle_path /office-api/* {
+        reverse_proxy 127.0.0.1:{$OFFICE_API_PORT}
+    }
+
+    handle /office* {
+        reverse_proxy 127.0.0.1:{$OFFICE_API_PORT}
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:{$VSS_UI_PORT}
+    }
+}

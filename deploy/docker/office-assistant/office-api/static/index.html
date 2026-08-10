@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>智能办公助手</title>
+  <style>
+    :root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#0b0e14;color:#eef2f6}body{margin:0;padding:32px}header{display:flex;justify-content:space-between;align-items:center;gap:16px}a{color:#76b900}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:24px 0}.card,table{background:#151a23;border:1px solid #2a3240;border-radius:10px}.card{padding:16px}.ok{color:#76b900}.bad{color:#ff6b6b}table{width:100%;border-collapse:collapse;overflow:hidden}th,td{padding:12px;border-bottom:1px solid #2a3240;text-align:left}button{background:#76b900;border:0;border-radius:6px;padding:8px 12px;cursor:pointer}
+  </style>
+</head>
+<body>
+  <header><div><h1>智能办公助手</h1><p>匿名占用与安防事件</p></div><a href="/">打开 VSS 聊天</a></header>
+  <section id="status" class="grid"></section>
+  <table><thead><tr><th>时间</th><th>类型</th><th>摄像头</th><th>状态</th><th>操作</th></tr></thead><tbody id="events"></tbody></table>
+  <script>
+    const api='/office-api';const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    async function refresh(){const [status,eventData]=await Promise.all([fetch(`${api}/api/status`).then(r=>r.json()),fetch(`${api}/api/events?limit=50`).then(r=>r.json()).catch(e=>({events:[],error:String(e)}))]);document.querySelector('#status').innerHTML=Object.entries(status).map(([name,state])=>`<div class="card"><strong>${esc(name)}</strong><p class="${state.healthy?'ok':'bad'}">${state.healthy?'正常':'不可用'}</p></div>`).join('');document.querySelector('#events').innerHTML=(eventData.events||[]).map(event=>{const id=encodeURIComponent(event.event_id);return `<tr><td>${esc(event['@timestamp']||event.timestamp)}</td><td>${esc(event.office_event_type||event.category||event.type)}</td><td>${esc(event.sensorId||event.camera_id)}</td><td>${event.acknowledgement?'已确认':'待处理'}</td><td><a href="${api}/api/events/${id}/clip" target="_blank">片段</a> <button onclick="ack('${id}')">确认</button></td></tr>`}).join('')||'<tr><td colspan="5">暂无事件或 Elasticsearch 尚未就绪</td></tr>'}
+    async function ack(id){await fetch(`${api}/api/events/${id}/acknowledge`,{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});refresh()}refresh();setInterval(refresh,15000);
+  </script>
+</body>
+</html>

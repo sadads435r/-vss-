@@ -1,0 +1,374 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Small read-only office dashboard facade for the VSS alerts profile."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sqlite3
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from datetime import time as datetime_time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import yaml
+
+CONFIG_FILE = Path(os.environ.get("OFFICE_CONFIG_FILE", "/config/office-config.yaml"))
+DATABASE_FILE = Path(os.environ.get("OFFICE_DATABASE_FILE", "/data/office.db"))
+CLIP_DIR = Path(os.environ.get("OFFICE_CLIP_DIR", "/data/clips"))
+ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://127.0.0.1:9200").rstrip("/")
+VSS_AGENT_URL = os.environ.get("VSS_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+VSS_VST_URL = os.environ.get("VSS_VST_URL", "http://127.0.0.1:30888").rstrip("/")
+STATIC_DIR = Path(__file__).with_name("static")
+
+
+class ConfigurationError(ValueError):
+    """Raised when office-config.yaml is incomplete or unsafe."""
+
+
+def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        raw = yaml.safe_load(handle)
+    if not isinstance(raw, dict):
+        raise ConfigurationError("configuration root must be a mapping")
+    if not raw.get("timezone"):
+        raise ConfigurationError("missing required field: timezone")
+    try:
+        ZoneInfo(str(raw["timezone"]))
+    except (KeyError, ValueError) as error:
+        raise ConfigurationError(f"invalid timezone: {raw['timezone']}") from error
+    for section in ("camera", "schedule", "retention", "rules", "zones"):
+        if section not in raw:
+            raise ConfigurationError(f"missing required section: {section}")
+    camera = raw["camera"]
+    if not isinstance(camera, dict) or not str(camera.get("rtsp_url", "")).startswith("rtsp://"):
+        raise ConfigurationError("camera.rtsp_url must use rtsp://")
+    days = int(raw["retention"].get("event_days", 0))
+    if days < 1 or days > 365:
+        raise ConfigurationError("retention.event_days must be between 1 and 365")
+    for rule_name in ("after_hours_presence", "restricted_zone_entry", "dwell_time", "occupancy_limit"):
+        if rule_name not in raw["rules"]:
+            raise ConfigurationError(f"missing required rule: {rule_name}")
+    for zone in raw["zones"]:
+        polygon = zone.get("polygon", [])
+        if len(polygon) < 3:
+            raise ConfigurationError(f"zone {zone.get('id', '<unknown>')} needs at least three points")
+        if any(len(point) != 2 or any(float(value) < 0 or float(value) > 1 for value in point) for point in polygon):
+            raise ConfigurationError("zone coordinates must be normalized into [0, 1]")
+    return raw
+
+
+def initialize_database() -> None:
+    DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DATABASE_FILE) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS acknowledgements "
+            "(event_id TEXT PRIMARY KEY, acknowledged_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '')"
+        )
+
+
+def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, method=method)
+    request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=4) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def service_status(url: str) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        with urllib.request.urlopen(url, timeout=2) as response:
+            return {"healthy": response.status < 500, "latency_ms": round((time.monotonic() - started) * 1000)}
+    except (OSError, urllib.error.URLError) as error:
+        return {"healthy": False, "error": str(error)}
+
+
+def acknowledgements(event_ids: list[str]) -> dict[str, dict[str, Any]]:
+    if not event_ids:
+        return {}
+    placeholders = ",".join("?" for _ in event_ids)
+    with sqlite3.connect(DATABASE_FILE) as connection:
+        rows = connection.execute(
+            f"SELECT event_id, acknowledged_at, note FROM acknowledgements WHERE event_id IN ({placeholders})",
+            event_ids,
+        ).fetchall()
+    return {row[0]: {"acknowledged_at": row[1], "note": row[2]} for row in rows}
+
+
+def nested_value(source: dict[str, Any], *paths: str) -> Any:
+    for path in paths:
+        value: Any = source
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                value = None
+                break
+            value = value[part]
+        if value is not None:
+            return value
+    return None
+
+
+def office_event_type(source: dict[str, Any], config: dict[str, Any]) -> str:
+    """Classify a verified VSS event using privacy-preserving office rules."""
+    zone_id = str(nested_value(source, "zone_id", "zoneId", "roi.id") or "")
+    restricted_zones = {str(zone["id"]) for zone in config["zones"] if zone.get("restricted")}
+    if config["rules"]["restricted_zone_entry"].get("enabled") and zone_id in restricted_zones:
+        return "restricted_zone_entry"
+
+    duration = float(nested_value(source, "duration_seconds", "duration", "metrics.duration") or 0)
+    dwell_rule = config["rules"]["dwell_time"]
+    if dwell_rule.get("enabled") and duration >= float(dwell_rule.get("seconds", 120)):
+        return "dwell_time"
+
+    objects = nested_value(source, "objects")
+    count = nested_value(source, "person_count", "objectCount", "metrics.count", "metrics.personCount")
+    if count is None and isinstance(objects, list):
+        count = sum(1 for item in objects if not isinstance(item, dict) or item.get("type", "person") == "person")
+    occupancy_rule = config["rules"]["occupancy_limit"]
+    if occupancy_rule.get("enabled") and int(count or 0) > int(occupancy_rule.get("maximum_people", 10)):
+        return "occupancy_limit"
+
+    timestamp = str(nested_value(source, "@timestamp", "timestamp", "started_at") or "")
+    after_hours_rule = config["rules"]["after_hours_presence"]
+    if after_hours_rule.get("enabled") and timestamp:
+        instant = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(ZoneInfo(config["timezone"]))
+        schedule = config["schedule"]
+        weekdays = {str(day).lower() for day in schedule["weekdays"]}
+        start = datetime_time.fromisoformat(str(schedule["start"]))
+        end = datetime_time.fromisoformat(str(schedule["end"]))
+        holiday = instant.date().isoformat() in set(schedule.get("holidays", []))
+        if holiday or instant.strftime("%A").lower() not in weekdays or not start <= instant.time().replace(tzinfo=None) < end:
+            return "after_hours_presence"
+    return "office_presence"
+
+
+def search_events(query: dict[str, list[str]], config: dict[str, Any]) -> dict[str, Any]:
+    size = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
+    filters: list[dict[str, Any]] = []
+    if query.get("type"):
+        filters.append({"term": {"category.keyword": query["type"][0]}})
+    if query.get("camera"):
+        filters.append({"term": {"sensorId.keyword": query["camera"][0]}})
+    if query.get("start") or query.get("end"):
+        time_range: dict[str, str] = {}
+        if query.get("start"):
+            time_range["gte"] = query["start"][0]
+        if query.get("end"):
+            time_range["lte"] = query["end"][0]
+        filters.append({"range": {"@timestamp": time_range}})
+    payload = {
+        "size": size,
+        "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
+        "query": {"bool": {"filter": filters}} if filters else {"match_all": {}},
+    }
+    result = request_json(f"{ELASTICSEARCH_URL}/mdx-*/_search", method="POST", payload=payload)
+    hits = result.get("hits", {}).get("hits", [])
+    ack = acknowledgements([str(hit.get("_id")) for hit in hits])
+    events = []
+    for hit in hits:
+        event_id = str(hit.get("_id"))
+        source = dict(hit.get("_source", {}))
+        source["event_id"] = event_id
+        source["acknowledgement"] = ack.get(event_id)
+        source["office_event_type"] = office_event_type(source, config)
+        events.append(source)
+    return {"events": events, "count": len(events)}
+
+
+def get_event(event_id: str) -> dict[str, Any] | None:
+    result = request_json(
+        f"{ELASTICSEARCH_URL}/mdx-*/_search",
+        method="POST",
+        payload={"size": 1, "query": {"ids": {"values": [event_id]}}},
+    )
+    hits = result.get("hits", {}).get("hits", [])
+    if not hits:
+        return None
+    source = dict(hits[0].get("_source", {}))
+    source["event_id"] = event_id
+    source["acknowledgement"] = acknowledgements([event_id]).get(event_id)
+    return source
+
+
+def cleanup_expired_clips(config: dict[str, Any]) -> None:
+    cutoff = time.time() - int(config["retention"]["event_days"]) * 86400
+    for clip in CLIP_DIR.rglob("*"):
+        if clip.is_file() and clip.stat().st_mtime < cutoff:
+            clip.unlink(missing_ok=True)
+
+
+def clip_path(event_id: str) -> Path:
+    return CLIP_DIR / f"{hashlib.sha256(event_id.encode('utf-8')).hexdigest()}.mp4"
+
+
+def event_clip_url(event: dict[str, Any]) -> str | None:
+    value = nested_value(event, "clip_url", "video_url", "videoUrl", "videoPath", "metadata.videoUrl")
+    return str(value) if value else None
+
+
+def archive_event_clips(config: dict[str, Any]) -> None:
+    result = search_events({"limit": ["200"]}, config)
+    for event in result["events"]:
+        status = str(nested_value(event, "verification_status", "verification.status", "verified") or "").lower()
+        if status in ("false", "rejected", "no"):
+            continue
+        url = event_clip_url(event)
+        destination = clip_path(str(event["event_id"]))
+        if not url or destination.exists():
+            continue
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        temporary = destination.with_suffix(".part")
+        try:
+            with urllib.request.urlopen(url, timeout=30) as source, temporary.open("wb") as output:
+                remaining = 256 * 1024 * 1024
+                while remaining > 0:
+                    chunk = source.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    remaining -= len(chunk)
+                if source.read(1):
+                    raise ValueError("event clip exceeds 256 MB limit")
+            temporary.replace(destination)
+        except (OSError, urllib.error.URLError, ValueError) as error:
+            temporary.unlink(missing_ok=True)
+            print(f"[office-api] could not archive event clip {event['event_id']}: {error}", flush=True)
+
+
+def maintenance_worker(config: dict[str, Any]) -> None:
+    cleanup_counter = 0
+    while True:
+        try:
+            archive_event_clips(config)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as error:
+            print(f"[office-api] event archive pass failed: {error}", flush=True)
+        if cleanup_counter % 60 == 0:
+            cleanup_expired_clips(config)
+        cleanup_counter += 1
+        time.sleep(60)
+
+
+class OfficeHandler(BaseHTTPRequestHandler):
+    server_version = "VSSOfficeAssistant/0.1"
+
+    def send_json(self, status: int, payload: Any) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def send_static(self, path: Path, content_type: str) -> None:
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path == "/healthz":
+                self.send_json(HTTPStatus.OK, {"status": "ok"})
+            elif parsed.path in ("/office", "/office/"):
+                self.send_static(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            elif parsed.path == "/api/config":
+                self.send_json(HTTPStatus.OK, self.server.office_config)  # type: ignore[attr-defined]
+            elif parsed.path == "/api/status":
+                self.send_json(HTTPStatus.OK, {
+                    "office_api": {"healthy": True},
+                    "vss_agent": service_status(f"{VSS_AGENT_URL}/health"),
+                    "vst": service_status(f"{VSS_VST_URL}/vst/api/v1/sensor/streams"),
+                    "elasticsearch": service_status(ELASTICSEARCH_URL),
+                    "rtsp_gateway": service_status("http://127.0.0.1:9997/v3/paths/list"),
+                })
+            elif parsed.path == "/api/events":
+                self.send_json(
+                    HTTPStatus.OK,
+                    search_events(urllib.parse.parse_qs(parsed.query), self.server.office_config),  # type: ignore[attr-defined]
+                )
+            elif parsed.path.startswith("/api/events/") and parsed.path.endswith("/clip"):
+                event_id = urllib.parse.unquote(
+                    parsed.path.removeprefix("/api/events/").removesuffix("/clip").rstrip("/")
+                )
+                local_clip = clip_path(event_id)
+                if local_clip.exists():
+                    self.send_static(local_clip, "video/mp4")
+                    return
+                event = get_event(event_id)
+                clip_url = event_clip_url(event or {})
+                if not clip_url:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "event clip not found"})
+                else:
+                    target = urllib.parse.urlparse(str(clip_url))
+                    if target.scheme not in ("http", "https"):
+                        self.send_json(HTTPStatus.BAD_REQUEST, {"error": "unsupported clip URL"})
+                    else:
+                        self.send_response(HTTPStatus.FOUND)
+                        self.send_header("Location", urllib.parse.urlunparse(("", "", target.path, "", target.query, "")))
+                        self.end_headers()
+            elif parsed.path.startswith("/api/events/"):
+                event_id = urllib.parse.unquote(parsed.path.removeprefix("/api/events/").split("/")[0])
+                event = get_event(event_id)
+                self.send_json(HTTPStatus.OK if event else HTTPStatus.NOT_FOUND, event or {"error": "event not found"})
+            else:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+        except (ConfigurationError, ValueError) as error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            self.send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if not parsed.path.endswith("/acknowledge") or not parsed.path.startswith("/api/events/"):
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        event_id = urllib.parse.unquote(parsed.path.removeprefix("/api/events/").removesuffix("/acknowledge").rstrip("/"))
+        length = min(int(self.headers.get("Content-Length", "0")), 4096)
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        note = str(payload.get("note", ""))[:1000]
+        acknowledged_at = int(time.time())
+        with sqlite3.connect(DATABASE_FILE) as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO acknowledgements(event_id, acknowledged_at, note) VALUES (?, ?, ?)",
+                (event_id, acknowledged_at, note),
+            )
+        self.send_json(HTTPStatus.OK, {"event_id": event_id, "acknowledged_at": acknowledged_at, "note": note})
+
+    def log_message(self, message_format: str, *args: Any) -> None:
+        print(f"[office-api] {self.address_string()} {message_format % args}", flush=True)
+
+
+def main() -> None:
+    config = load_config()
+    initialize_database()
+    cleanup_expired_clips(config)
+    threading.Thread(target=maintenance_worker, args=(config,), daemon=True).start()
+    port = int(os.environ.get("OFFICE_API_PORT", "8090"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), OfficeHandler)
+    server.office_config = config  # type: ignore[attr-defined]
+    print(f"[office-api] listening on http://127.0.0.1:{port}", flush=True)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
