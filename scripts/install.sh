@@ -10,7 +10,7 @@ export NGC_CLI_API_KEY="$(read_env NGC_CLI_API_KEY)"
 export HF_TOKEN="$(read_env HF_TOKEN)"
 export ELASTICSEARCH_ILM_MIN_AGE="7d"
 export VST_VIDEO_STORAGE_SIZE_MB="$(read_env VST_VIDEO_STORAGE_SIZE_MB)"
-export VLM_AS_VERIFIER_ALERT_TYPE_CONFIG_FILE="${REPO_ROOT}/deploy/docker/office-assistant/alert_type_config.json"
+export VLM_AS_VERIFIER_ALERT_TYPE_CONFIG_FILE="${REPO_ROOT}/deploy/docker/developer-profiles/office-assistant/alert_type_config.json"
 
 host_ip="$(ip route get 1.1.1.1 | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 if [[ -z "${host_ip}" ]]; then
@@ -56,4 +56,4 @@ for attempt in $(seq 1 20); do
 done
 
 echo "[OK] Office assistant is available at https://${host_ip}:$(read_env OFFICE_HTTPS_PORT)/office"
-echo "[INFO] Trust the Caddy local CA from deploy/docker/office-assistant/caddy-data/caddy/pki/authorities/local/root.crt on office clients."
+echo "[INFO] Trust the Caddy local CA from deploy/docker/developer-profiles/office-assistant/caddy-data/caddy/pki/authorities/local/root.crt on office clients."

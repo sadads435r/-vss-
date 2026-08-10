@@ -20,8 +20,9 @@ deploy/docker/rag-secret.override.yml
 /.env
 /config/office-config.yaml
 /data/office-assistant/
-/deploy/docker/office-assistant/caddy-data/
-/deploy/docker/office-assistant/caddy-config/
+/deploy/docker/developer-profiles/office-assistant/caddy-data/
+/deploy/docker/developer-profiles/office-assistant/caddy-config/
+.workbuddy/
 
 *.log
 *checkpoint.*

@@ -4,7 +4,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+import app
 from app import ConfigurationError
 from app import load_config
 from app import office_event_type
@@ -12,6 +14,7 @@ from app import office_event_type
 VALID_CONFIG = """
 timezone: Asia/Hong_Kong
 camera: {rtsp_url: 'rtsp://127.0.0.1:8554/office-main'}
+occupancy: {poll_seconds: 2, departure_timeout_seconds: 10, minimum_person_confidence: 0.3, history_limit: 100}
 schedule: {weekdays: [monday], start: '09:00', end: '18:00'}
 retention: {event_days: 7}
 rules:
@@ -83,6 +86,47 @@ class ConfigTest(unittest.TestCase):
             "after_hours_presence": {"enabled": False},
         }
         self.assertEqual(office_event_type({"duration_seconds": 121}, config), "dwell_time")
+
+    def test_presence_arrival_and_departure(self) -> None:
+        config = load_config(self.write_config(VALID_CONFIG))
+        frame = {
+            "id": "frame-1",
+            "sensorId": "camera-1",
+            "timestamp": "2026-08-10T01:00:00Z",
+            "objects": [
+                {"id": "track-1", "type": "Person", "confidence": 0.9},
+                {"id": "track-2", "type": "Person", "confidence": 0.8},
+                {"id": "chair-1", "type": "Chair", "confidence": 0.99},
+            ],
+        }
+        observed_at = app.parse_timestamp(frame["timestamp"])
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "office.db"
+            clips = Path(directory) / "clips"
+            with patch.object(app, "DATABASE_FILE", database), patch.object(app, "CLIP_DIR", clips):
+                app.initialize_database()
+                app.update_presence(frame, config, now=observed_at)
+                snapshot = app.occupancy_snapshot(config, now=observed_at)
+                self.assertEqual(snapshot["current_count"], 2)
+                self.assertEqual(snapshot["today_session_count"], 2)
+
+                # Re-reading the same Elasticsearch frame must not create duplicate sessions.
+                app.update_presence(frame, config, now=observed_at + 1)
+                self.assertEqual(app.occupancy_snapshot(config, now=observed_at + 1)["today_session_count"], 2)
+
+                app.update_presence(None, config, now=observed_at + 11)
+                departed = app.occupancy_snapshot(config, now=observed_at + 11)
+                self.assertEqual(departed["current_count"], 0)
+                self.assertTrue(all(session["status"] == "left" for session in departed["history"]))
+
+    def test_filters_low_confidence_people(self) -> None:
+        frame = {
+            "objects": [
+                {"id": "accepted", "type": "Person", "confidence": 0.7},
+                {"id": "rejected", "type": "Person", "confidence": 0.2},
+            ]
+        }
+        self.assertEqual(app.extract_people(frame, 0.3), {"accepted": 0.7})
 
 
 if __name__ == "__main__":

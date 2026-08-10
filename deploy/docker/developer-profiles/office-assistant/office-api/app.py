@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from datetime import datetime
 from datetime import time as datetime_time
 from http import HTTPStatus
@@ -49,7 +50,7 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
         ZoneInfo(str(raw["timezone"]))
     except (KeyError, ValueError) as error:
         raise ConfigurationError(f"invalid timezone: {raw['timezone']}") from error
-    for section in ("camera", "schedule", "retention", "rules", "zones"):
+    for section in ("camera", "occupancy", "schedule", "retention", "rules", "zones"):
         if section not in raw:
             raise ConfigurationError(f"missing required section: {section}")
     camera = raw["camera"]
@@ -58,6 +59,15 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
     days = int(raw["retention"].get("event_days", 0))
     if days < 1 or days > 365:
         raise ConfigurationError("retention.event_days must be between 1 and 365")
+    poll_seconds = float(raw["occupancy"].get("poll_seconds", 0))
+    departure_timeout = float(raw["occupancy"].get("departure_timeout_seconds", 0))
+    confidence = float(raw["occupancy"].get("minimum_person_confidence", -1))
+    if poll_seconds < 0.5:
+        raise ConfigurationError("occupancy.poll_seconds must be at least 0.5")
+    if departure_timeout < poll_seconds:
+        raise ConfigurationError("occupancy.departure_timeout_seconds must be at least poll_seconds")
+    if not 0 <= confidence <= 1:
+        raise ConfigurationError("occupancy.minimum_person_confidence must be between 0 and 1")
     for rule_name in ("after_hours_presence", "restricted_zone_entry", "dwell_time", "occupancy_limit"):
         if rule_name not in raw["rules"]:
             raise ConfigurationError(f"missing required rule: {rule_name}")
@@ -73,10 +83,22 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
 def initialize_database() -> None:
     DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DATABASE_FILE) as connection:
+    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS acknowledgements "
             "(event_id TEXT PRIMARY KEY, acknowledged_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '')"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS presence_sessions ("
+            "session_id INTEGER PRIMARY KEY AUTOINCREMENT, camera_id TEXT NOT NULL, track_id TEXT NOT NULL, "
+            "arrived_at REAL NOT NULL, last_seen_at REAL NOT NULL, left_at REAL)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_presence_open "
+            "ON presence_sessions(camera_id, track_id, left_at)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS occupancy_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
 
 
@@ -97,11 +119,146 @@ def service_status(url: str) -> dict[str, Any]:
         return {"healthy": False, "error": str(error)}
 
 
+def parse_timestamp(value: str) -> float:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def fetch_latest_frame(config: dict[str, Any]) -> dict[str, Any] | None:
+    sensor_id = str(config["camera"].get("vss_sensor_id", "")).strip()
+    query: dict[str, Any] = {"match_all": {}}
+    if sensor_id:
+        query = {"term": {"sensorId.keyword": sensor_id}}
+    payload = {
+        "size": 1,
+        "sort": [{"timestamp": {"order": "desc", "unmapped_type": "date"}}],
+        "query": query,
+    }
+    result = request_json(f"{ELASTICSEARCH_URL}/mdx-frames-*/_search", method="POST", payload=payload)
+    hits = result.get("hits", {}).get("hits", [])
+    return dict(hits[0].get("_source", {})) if hits else None
+
+
+def extract_people(frame: dict[str, Any], minimum_confidence: float) -> dict[str, float]:
+    people: dict[str, float] = {}
+    for detected_object in frame.get("objects", []):
+        if str(detected_object.get("type", "")).casefold() != "person":
+            continue
+        track_id = str(detected_object.get("id", "")).strip()
+        confidence = float(detected_object.get("confidence", 0))
+        if track_id and confidence >= minimum_confidence:
+            people[track_id] = confidence
+    return people
+
+
+def update_presence(frame: dict[str, Any] | None, config: dict[str, Any], now: float | None = None) -> None:
+    current_time = time.time() if now is None else now
+    timeout = float(config["occupancy"].get("departure_timeout_seconds", 10))
+    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+        if frame:
+            frame_token = f"{frame.get('sensorId', '')}:{frame.get('id', '')}:{frame.get('timestamp', '')}"
+            previous = connection.execute(
+                "SELECT value FROM occupancy_state WHERE key = 'last_frame_token'"
+            ).fetchone()
+            if not previous or previous[0] != frame_token:
+                camera_id = str(frame.get("sensorId") or config["camera"]["id"])
+                seen_at = parse_timestamp(str(frame.get("timestamp"))) if frame.get("timestamp") else current_time
+                people = extract_people(
+                    frame,
+                    float(config["occupancy"].get("minimum_person_confidence", 0.3)),
+                )
+                for track_id in people:
+                    open_session = connection.execute(
+                        "SELECT session_id FROM presence_sessions "
+                        "WHERE camera_id = ? AND track_id = ? AND left_at IS NULL ORDER BY session_id DESC LIMIT 1",
+                        (camera_id, track_id),
+                    ).fetchone()
+                    if open_session:
+                        connection.execute(
+                            "UPDATE presence_sessions SET last_seen_at = ? WHERE session_id = ?",
+                            (seen_at, open_session[0]),
+                        )
+                    else:
+                        connection.execute(
+                            "INSERT INTO presence_sessions(camera_id, track_id, arrived_at, last_seen_at) "
+                            "VALUES (?, ?, ?, ?)",
+                            (camera_id, track_id, seen_at, seen_at),
+                        )
+                connection.execute(
+                    "INSERT OR REPLACE INTO occupancy_state(key, value) VALUES ('last_frame_token', ?)",
+                    (frame_token,),
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO occupancy_state(key, value) VALUES ('last_frame_timestamp', ?)",
+                    (str(seen_at),),
+                )
+        connection.execute(
+            "UPDATE presence_sessions SET left_at = last_seen_at "
+            "WHERE left_at IS NULL AND last_seen_at < ?",
+            (current_time - timeout,),
+        )
+
+
+def occupancy_snapshot(config: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+    current_time = time.time() if now is None else now
+    timeout = float(config["occupancy"].get("departure_timeout_seconds", 10))
+    timezone = ZoneInfo(str(config["timezone"]))
+    local_now = datetime.fromtimestamp(current_time, timezone)
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    history_limit = min(max(int(config["occupancy"].get("history_limit", 100)), 1), 500)
+    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+        active_rows = connection.execute(
+            "SELECT session_id, camera_id, track_id, arrived_at, last_seen_at "
+            "FROM presence_sessions WHERE left_at IS NULL AND last_seen_at >= ? ORDER BY arrived_at",
+            (current_time - timeout,),
+        ).fetchall()
+        history_rows = connection.execute(
+            "SELECT session_id, camera_id, track_id, arrived_at, last_seen_at, left_at "
+            "FROM presence_sessions WHERE arrived_at >= ? ORDER BY arrived_at DESC LIMIT ?",
+            (day_start, history_limit),
+        ).fetchall()
+        frame_row = connection.execute(
+            "SELECT value FROM occupancy_state WHERE key = 'last_frame_timestamp'"
+        ).fetchone()
+    last_frame_at = float(frame_row[0]) if frame_row else None
+    active = [
+        {
+            "session_id": row[0],
+            "camera_id": row[1],
+            "track_id": row[2],
+            "arrived_at": row[3],
+            "last_seen_at": row[4],
+        }
+        for row in active_rows
+    ]
+    history = [
+        {
+            "session_id": row[0],
+            "camera_id": row[1],
+            "track_id": row[2],
+            "arrived_at": row[3],
+            "last_seen_at": row[4],
+            "left_at": row[5],
+            "duration_seconds": round((row[5] or current_time) - row[3]),
+            "status": "working" if row[5] is None and row[4] >= current_time - timeout else "left",
+        }
+        for row in history_rows
+    ]
+    return {
+        "current_count": len(active),
+        "active_people": active,
+        "today_session_count": len(history),
+        "history": history,
+        "last_frame_at": last_frame_at,
+        "data_age_seconds": round(max(0, current_time - last_frame_at), 1) if last_frame_at else None,
+        "camera_online": bool(last_frame_at and current_time - last_frame_at <= timeout * 2),
+    }
+
+
 def acknowledgements(event_ids: list[str]) -> dict[str, dict[str, Any]]:
     if not event_ids:
         return {}
     placeholders = ",".join("?" for _ in event_ids)
-    with sqlite3.connect(DATABASE_FILE) as connection:
+    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
         rows = connection.execute(
             f"SELECT event_id, acknowledged_at, note FROM acknowledgements WHERE event_id IN ({placeholders})",
             event_ids,
@@ -264,6 +421,18 @@ def maintenance_worker(config: dict[str, Any]) -> None:
         time.sleep(60)
 
 
+def occupancy_worker(config: dict[str, Any]) -> None:
+    poll_seconds = max(float(config["occupancy"].get("poll_seconds", 2)), 0.5)
+    while True:
+        frame = None
+        try:
+            frame = fetch_latest_frame(config)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as error:
+            print(f"[office-api] occupancy frame poll failed: {error}", flush=True)
+        update_presence(frame, config)
+        time.sleep(poll_seconds)
+
+
 class OfficeHandler(BaseHTTPRequestHandler):
     server_version = "VSSOfficeAssistant/0.1"
 
@@ -301,6 +470,11 @@ class OfficeHandler(BaseHTTPRequestHandler):
                     "elasticsearch": service_status(ELASTICSEARCH_URL),
                     "rtsp_gateway": service_status("http://127.0.0.1:9997/v3/paths/list"),
                 })
+            elif parsed.path == "/api/occupancy/current":
+                self.send_json(
+                    HTTPStatus.OK,
+                    occupancy_snapshot(self.server.office_config),  # type: ignore[attr-defined]
+                )
             elif parsed.path == "/api/events":
                 self.send_json(
                     HTTPStatus.OK,
@@ -347,7 +521,7 @@ class OfficeHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         note = str(payload.get("note", ""))[:1000]
         acknowledged_at = int(time.time())
-        with sqlite3.connect(DATABASE_FILE) as connection:
+        with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
             connection.execute(
                 "INSERT OR REPLACE INTO acknowledgements(event_id, acknowledged_at, note) VALUES (?, ?, ?)",
                 (event_id, acknowledged_at, note),
@@ -363,6 +537,7 @@ def main() -> None:
     initialize_database()
     cleanup_expired_clips(config)
     threading.Thread(target=maintenance_worker, args=(config,), daemon=True).start()
+    threading.Thread(target=occupancy_worker, args=(config,), daemon=True).start()
     port = int(os.environ.get("OFFICE_API_PORT", "8090"))
     server = ThreadingHTTPServer(("127.0.0.1", port), OfficeHandler)
     server.office_config = config  # type: ignore[attr-defined]

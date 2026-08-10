@@ -15,3 +15,6 @@ echo
 echo "== Office API =="
 curl --silent --show-error "http://127.0.0.1:$(read_env OFFICE_API_PORT)/api/status" || true
 echo
+echo "== Live occupancy =="
+curl --silent --show-error "http://127.0.0.1:$(read_env OFFICE_API_PORT)/api/occupancy/current" || true
+echo

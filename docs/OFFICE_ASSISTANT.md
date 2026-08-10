@@ -25,6 +25,8 @@ docker run --rm caddy:2.10.0-alpine caddy hash-password --plaintext 'your-passwo
 
 编辑 `config/office-config.yaml`，确认工作时间、节假日、人数上限和 ROI。ROI 坐标以画面左上角为 `(0,0)`、右下角为 `(1,1)`。示例 ROI 只是占位值，正式告警前必须现场标定。
 
+人数统计默认每 2 秒读取 Elasticsearch 最新的 `mdx-frames-*` 帧。人员连续 10 秒未被同一摄像头看到后记为离开；这两个值可以通过 `occupancy.poll_seconds` 和 `occupancy.departure_timeout_seconds` 调整。多摄像头环境必须填写 `camera.vss_sensor_id`，避免统计其他摄像头。
+
 ## 3. 安装与验证
 
 ```bash
@@ -34,7 +36,9 @@ docker run --rm caddy:2.10.0-alpine caddy hash-password --plaintext 'your-passwo
 ./scripts/status.sh
 ```
 
-默认入口为 `https://<SPARK_IP>:8443/office`，VSS 聊天位于同一入口根路径。Caddy 使用本地 CA；将 `deploy/docker/office-assistant/caddy-data/caddy/pki/authorities/local/root.crt` 导入受信任办公终端，或替换 Caddyfile 使用组织签发的证书。
+默认入口为 `https://<SPARK_IP>:8443/office`，VSS 聊天位于同一入口根路径。Caddy 使用本地 CA；将 `deploy/docker/developer-profiles/office-assistant/caddy-data/caddy/pki/authorities/local/root.crt` 导入受信任办公终端，或替换 Caddyfile 使用组织签发的证书。
+
+办公面板每 2 秒刷新当前可见人数，显示每个匿名 Track ID 的出现时间、最后看到时间、离开时间和停留时长。结构化接口为 `GET /office-api/api/occupancy/current`。
 
 安装脚本会尝试通过 VSS Agent API 自动注册 `rtsp://127.0.0.1:8554/office-main`。如果 VSS 启动较慢导致注册失败，可在 VSS 的 Video Management 页面手动添加同一 URL。
 

@@ -46,8 +46,8 @@ services:
       VSS_AGENT_URL: http://127.0.0.1:${VSS_AGENT_PORT:-8000}
       VSS_VST_URL: http://127.0.0.1:${VSS_VST_PORT:-30888}
     volumes:
-      - ../../../config/office-config.yaml:/config/office-config.yaml:ro
-      - ../../../data/office-assistant:/data
+      - ../../../../config/office-config.yaml:/config/office-config.yaml:ro
+      - ../../../../data/office-assistant:/data
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ['OFFICE_API_PORT'] + '/healthz', timeout=2)\""]
       interval: 15s

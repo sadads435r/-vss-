@@ -12,6 +12,7 @@ probe() {
 probe "MediaMTX API" "http://127.0.0.1:9997/v3/paths/list"
 probe "Office API" "http://127.0.0.1:$(read_env OFFICE_API_PORT)/healthz"
 probe "Office status" "http://127.0.0.1:$(read_env OFFICE_API_PORT)/api/status"
+probe "Live occupancy API" "http://127.0.0.1:$(read_env OFFICE_API_PORT)/api/occupancy/current"
 probe "VSS UI ingress" "http://127.0.0.1:$(read_env VSS_UI_PORT)/"
 probe "VST sensor API" "http://127.0.0.1:$(read_env VSS_VST_PORT)/vst/api/v1/sensor/streams"
 

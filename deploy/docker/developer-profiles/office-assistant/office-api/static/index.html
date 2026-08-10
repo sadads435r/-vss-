@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>智能办公助手</title>
+  <style>
+    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #0b0e14; color: #eef2f6; }
+    body { margin: 0; padding: 32px; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+    h2 { margin-top: 32px; }
+    a { color: #76b900; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 16px 0 24px; }
+    .card, table { background: #151a23; border: 1px solid #2a3240; border-radius: 10px; }
+    .card { padding: 16px; }
+    .metric { font-size: 36px; font-weight: 700; margin: 8px 0 0; }
+    .muted { color: #9aa5b4; }
+    .ok { color: #76b900; }
+    .bad { color: #ff6b6b; }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; }
+    th, td { padding: 12px; border-bottom: 1px solid #2a3240; text-align: left; }
+    button { background: #76b900; border: 0; border-radius: 6px; padding: 8px 12px; cursor: pointer; }
+    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: currentColor; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>智能办公助手</h1><p class="muted">匿名人数、进出时间与安防事件</p></div>
+    <a href="/">打开 VSS 聊天</a>
+  </header>
+
+  <section class="grid">
+    <div class="card"><div class="muted">当前正在办公（画面可见）</div><div id="current-count" class="metric">--</div></div>
+    <div class="card"><div class="muted">今日到访记录</div><div id="today-count" class="metric">--</div></div>
+    <div class="card"><div class="muted">摄像头数据</div><div id="camera-state" class="metric">--</div><small id="data-age" class="muted"></small></div>
+  </section>
+
+  <h2>正在办公</h2>
+  <table>
+    <thead><tr><th>匿名编号</th><th>出现时间</th><th>已停留</th><th>摄像头</th><th>状态</th></tr></thead>
+    <tbody id="active-people"></tbody>
+  </table>
+
+  <h2>今日进出记录</h2>
+  <table>
+    <thead><tr><th>匿名编号</th><th>出现时间</th><th>离开时间</th><th>停留时长</th><th>状态</th></tr></thead>
+    <tbody id="presence-history"></tbody>
+  </table>
+
+  <h2>系统状态</h2>
+  <section id="status" class="grid"></section>
+
+  <h2>办公事件</h2>
+  <table>
+    <thead><tr><th>时间</th><th>类型</th><th>摄像头</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody id="events"></tbody>
+  </table>
+
+  <script>
+    const api = '/office-api';
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[character]));
+    const formatTime = seconds => seconds ? new Date(seconds * 1000).toLocaleString('zh-CN', {hour12: false}) : '—';
+    const formatDuration = seconds => {
+      const total = Math.max(0, Math.round(seconds || 0));
+      const hours = Math.floor(total / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const remainder = total % 60;
+      return `${hours ? `${hours}小时 ` : ''}${minutes ? `${minutes}分 ` : ''}${remainder}秒`;
+    };
+    const personLabel = trackId => `人员 ${esc(trackId)}`;
+
+    async function refreshOccupancy() {
+      try {
+        const data = await fetch(`${api}/api/occupancy/current`, {cache: 'no-store'}).then(response => response.json());
+        document.querySelector('#current-count').textContent = data.current_count ?? 0;
+        document.querySelector('#today-count').textContent = data.today_session_count ?? 0;
+        document.querySelector('#camera-state').textContent = data.camera_online ? '在线' : '离线';
+        document.querySelector('#camera-state').className = `metric ${data.camera_online ? 'ok' : 'bad'}`;
+        document.querySelector('#data-age').textContent = data.data_age_seconds == null ? '尚未收到人员帧数据' : `数据延迟 ${data.data_age_seconds} 秒`;
+        const now = Date.now() / 1000;
+        document.querySelector('#active-people').innerHTML = (data.active_people || []).map(person => `
+          <tr><td>${personLabel(person.track_id)}</td><td>${formatTime(person.arrived_at)}</td>
+          <td>${formatDuration(now - person.arrived_at)}</td><td>${esc(person.camera_id)}</td>
+          <td class="ok"><span class="status-dot"></span>正在办公</td></tr>
+        `).join('') || '<tr><td colspan="5">当前没有检测到人员</td></tr>';
+        document.querySelector('#presence-history').innerHTML = (data.history || []).map(session => `
+          <tr><td>${personLabel(session.track_id)}</td><td>${formatTime(session.arrived_at)}</td>
+          <td>${formatTime(session.left_at)}</td><td>${formatDuration(session.duration_seconds)}</td>
+          <td class="${session.status === 'working' ? 'ok' : 'muted'}">${session.status === 'working' ? '正在办公' : '已离开'}</td></tr>
+        `).join('') || '<tr><td colspan="5">今天还没有人员记录</td></tr>';
+      } catch (error) {
+        document.querySelector('#camera-state').textContent = '异常';
+        document.querySelector('#camera-state').className = 'metric bad';
+        document.querySelector('#data-age').textContent = String(error);
+      }
+    }
+
+    async function refreshSlowData() {
+      const [status, eventData] = await Promise.all([
+        fetch(`${api}/api/status`, {cache: 'no-store'}).then(response => response.json()),
+        fetch(`${api}/api/events?limit=50`, {cache: 'no-store'}).then(response => response.json()).catch(error => ({events: [], error: String(error)}))
+      ]);
+      document.querySelector('#status').innerHTML = Object.entries(status).map(([name, state]) => `
+        <div class="card"><strong>${esc(name)}</strong><p class="${state.healthy ? 'ok' : 'bad'}">${state.healthy ? '正常' : '不可用'}</p></div>
+      `).join('');
+      document.querySelector('#events').innerHTML = (eventData.events || []).map(event => {
+        const id = encodeURIComponent(event.event_id);
+        return `<tr><td>${esc(event['@timestamp'] || event.timestamp)}</td>
+          <td>${esc(event.office_event_type || event.category || event.type)}</td>
+          <td>${esc(event.sensorId || event.camera_id)}</td>
+          <td>${event.acknowledgement ? '已确认' : '待处理'}</td>
+          <td><a href="${api}/api/events/${id}/clip" target="_blank">片段</a> <button onclick="ack('${id}')">确认</button></td></tr>`;
+      }).join('') || '<tr><td colspan="5">暂无事件或 Elasticsearch 尚未就绪</td></tr>';
+    }
+
+    async function ack(id) {
+      await fetch(`${api}/api/events/${id}/acknowledge`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      refreshSlowData();
+    }
+
+    refreshOccupancy();
+    refreshSlowData();
+    setInterval(refreshOccupancy, 2000);
+    setInterval(refreshSlowData, 15000);
+  </script>
+</body>
+</html>

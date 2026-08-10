@@ -4,9 +4,17 @@ timezone: Asia/Hong_Kong
 camera:
   id: office-main
   name: Office Main Camera
+  # Optional: set this to the sensorId emitted by VSS when more than one camera exists.
+  vss_sensor_id: ""
   rtsp_url: rtsp://127.0.0.1:8554/office-main
   resolution: [1920, 1080]
   fps: 10
+
+occupancy:
+  poll_seconds: 2
+  departure_timeout_seconds: 10
+  minimum_person_confidence: 0.3
+  history_limit: 100
 
 schedule:
   weekdays: [monday, tuesday, wednesday, thursday, friday]
