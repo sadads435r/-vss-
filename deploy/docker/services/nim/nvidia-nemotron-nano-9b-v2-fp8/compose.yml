@@ -15,7 +15,7 @@
 
 services:
   nvidia-nemotron-nano-9b-v2-fp8-toolcall-init:
-    # Fetch toolcall parser from Hugging Face (public repo, no HF_TOKEN required).
+    # Fetch the public NVIDIA toolcall parser from its ModelScope mirror.
     image: alpine/curl:8.17.0
     container_name: nvidia-nemotron-nano-9b-v2-fp8-toolcall-init
     profiles:
@@ -26,7 +26,7 @@ services:
     command:
       - sh
       - -c
-      - "curl -fSL -o /out/nemotron_toolcall_parser_no_streaming.py https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2/resolve/main/nemotron_toolcall_parser_no_streaming.py"
+      - "curl -fSL -o /out/nemotron_toolcall_parser_no_streaming.py https://www.modelscope.cn/models/nv-community/NVIDIA-Nemotron-Nano-9B-v2/resolve/master/nemotron_toolcall_parser_no_streaming.py"
     restart: "no"
 
   nvidia-nemotron-nano-9b-v2-fp8:
