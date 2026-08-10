@@ -11,6 +11,8 @@ export HF_TOKEN="$(read_env HF_TOKEN)"
 export ELASTICSEARCH_ILM_MIN_AGE="7d"
 export VST_VIDEO_STORAGE_SIZE_MB="$(read_env VST_VIDEO_STORAGE_SIZE_MB)"
 export VLM_AS_VERIFIER_ALERT_TYPE_CONFIG_FILE="${REPO_ROOT}/deploy/docker/developer-profiles/office-assistant/alert_type_config.json"
+export OFFICE_UID="$(id -u)"
+export OFFICE_GID="$(id -g)"
 
 host_ip="$(ip route get 1.1.1.1 | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 if [[ -z "${host_ip}" ]]; then
@@ -25,7 +27,7 @@ echo "[INFO] Deploying NVIDIA VSS alerts profile on ${host_ip}..."
   --host-ip "${host_ip}" \
   --external-ip "${host_ip}" \
   --mode verification \
-  --llm nvidia/nvidia-nemotron-nano-9b-v2 \
+  --llm nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8 \
   --vlm nvidia/cosmos3-reasoner
 
 generated_env="${REPO_ROOT}/deploy/docker/developer-profiles/dev-profile-alerts/generated.env"
