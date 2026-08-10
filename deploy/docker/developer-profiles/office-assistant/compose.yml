@@ -61,8 +61,6 @@ services:
     restart: unless-stopped
     environment:
       OFFICE_HTTPS_PORT: ${OFFICE_HTTPS_PORT:-8443}
-      OFFICE_USERNAME: ${OFFICE_USERNAME:-office}
-      OFFICE_PASSWORD_HASH: ${OFFICE_PASSWORD_HASH:?Set OFFICE_PASSWORD_HASH in .env}
       OFFICE_API_PORT: ${OFFICE_API_PORT:-8090}
       VSS_UI_PORT: ${VSS_UI_PORT:-7777}
     volumes:

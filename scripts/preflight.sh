@@ -21,7 +21,6 @@ docker compose version >/dev/null 2>&1 || { echo "[FAIL] Docker Compose v2 is un
 camera_device="$(read_env CAMERA_DEVICE)"; camera_device="${camera_device:-/dev/video0}"
 [[ -c "${camera_device}" ]] || { echo "[FAIL] Camera is not a character device: ${camera_device}" >&2; errors=$((errors + 1)); }
 [[ -n "$(read_env NGC_CLI_API_KEY)" ]] || { echo "[FAIL] NGC_CLI_API_KEY is empty in .env" >&2; errors=$((errors + 1)); }
-[[ -n "$(read_env OFFICE_PASSWORD_HASH)" ]] || { echo "[FAIL] OFFICE_PASSWORD_HASH is empty in .env" >&2; errors=$((errors + 1)); }
 
 available_gb="$(df -Pk "${REPO_ROOT}" | awk 'NR==2 {printf "%d", $4/1024/1024}')"
 [[ "${available_gb}" -ge 30 ]] || { echo "[FAIL] At least 30 GB free disk is required; found ${available_gb} GB" >&2; errors=$((errors + 1)); }

@@ -1,6 +1,6 @@
 # VSS 智能办公助手（DGX Spark）
 
-本扩展在 NVIDIA VSS `dev-profile-alerts` 之上增加单路 USB 摄像头、匿名办公事件分类、事件面板和经过认证的 HTTPS 入口。VSS 核心服务保持原样，便于定位官方组件问题。
+本扩展在 NVIDIA VSS `dev-profile-alerts` 之上增加单路 USB 摄像头、匿名办公事件分类、事件面板和内网 HTTPS 入口。VSS 核心服务保持原样，便于定位官方组件问题。
 
 ## 1. Spark 前置条件
 
@@ -17,11 +17,7 @@ cp .env.example .env
 cp config/office-config.example.yaml config/office-config.yaml
 ```
 
-编辑 `.env`，设置摄像头设备、NGC key 和入口密码哈希。密码哈希可在 Spark 上生成：
-
-```bash
-docker run --rm caddy:2.10.0-alpine caddy hash-password --plaintext 'your-password'
-```
+编辑 `.env`，设置摄像头设备、NGC key 和 Hugging Face token。Web 入口不要求用户名或密码，因此只能部署在受控办公内网，不能暴露到公网。
 
 编辑 `config/office-config.yaml`，确认工作时间、节假日、人数上限和 ROI。ROI 坐标以画面左上角为 `(0,0)`、右下角为 `(1,1)`。示例 ROI 只是占位值，正式告警前必须现场标定。
 
@@ -53,7 +49,7 @@ docker run --rm caddy:2.10.0-alpine caddy hash-password --plaintext 'your-passwo
 
 ## 5. 网络安全
 
-只向办公网开放 HTTPS 端口（默认 8443），SSH 仅向管理员网段开放。端口 7777、8000、8090、8554、9080、9200、9901、30888 和模型服务端口不得暴露给不受信任网络。宿主机防火墙因环境差异不会由安装脚本自动修改。
+Web 入口没有登录密码。只向受信任办公网开放 HTTPS 端口（默认 8443），SSH 仅向管理员网段开放；严禁将 8443 暴露到公网。端口 7777、8000、8090、8554、9080、9200、9901、30888 和模型服务端口不得暴露给不受信任网络。宿主机防火墙因环境差异不会由安装脚本自动修改。
 
 ## 6. 发布与回滚
 
