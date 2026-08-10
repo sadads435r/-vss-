@@ -19,7 +19,7 @@ occupancy:
 schedule:
   weekdays: [monday, tuesday, wednesday, thursday, friday]
   start: "09:00"
-  end: "18:00"
+  end: "20:00"
   holidays: []
 
 retention:
@@ -33,9 +33,9 @@ rules:
   after_hours_presence:
     enabled: true
   restricted_zone_entry:
-    enabled: true
+    enabled: false
   dwell_time:
-    enabled: true
+    enabled: false
     seconds: 120
   occupancy_limit:
     enabled: true
@@ -46,9 +46,9 @@ rules:
 zones:
   - id: restricted-area
     name: Restricted Area
-    restricted: true
+    restricted: false
     polygon:
-      - [0.65, 0.15]
+      - [0.15, 0.15]
       - [0.95, 0.15]
       - [0.95, 0.95]
-      - [0.65, 0.95]
+      - [0.15, 0.95]
