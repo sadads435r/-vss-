@@ -5,7 +5,7 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/comm
 errors=0
 check() { "$@" || { echo "[FAIL] $*" >&2; errors=$((errors + 1)); }; }
 
-for command_name in git git-lfs docker curl nvidia-smi v4l2-ctl python3; do
+for command_name in git git-lfs docker curl ngc nvidia-smi v4l2-ctl python3; do
   check require_command "${command_name}"
 done
 require_file "${OFFICE_ENV}"

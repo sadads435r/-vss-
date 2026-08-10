@@ -6,7 +6,7 @@
 
 - DGX OS 7.4、NVIDIA 驱动 580.95.05 或兼容版本。
 - Docker 28.3.3+ 且低于 29.5.0、Docker Compose 2.39.1+、NVIDIA Container Toolkit 1.17.8+。
-- `git-lfs`、`curl`、`v4l2-ctl`、至少 30 GB 可用空间。
+- `git-lfs`、`curl`、NVIDIA NGC CLI（`ngc`）、`v4l2-ctl`、至少 30 GB 可用空间。
 - 一个可用的 NVIDIA NGC API key，以及允许下载所需模型的凭据。
 - 一台支持 1920×1080 MJPEG 或 raw 输出的 USB 摄像头。
 
