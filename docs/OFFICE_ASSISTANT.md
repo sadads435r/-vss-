@@ -1,4 +1,6 @@
-# VSS 智能办公助手（DGX Spark）
+# VSS 单工位专注助手（DGX Spark）
+
+本项目只分析一个固定椅子 ROI 内的匿名使用者。RT-CV 持续检测人物；只有最新帧中人物框底部中心位于椅子 ROI 时，Office API 才每 20 秒调用一次本地 `nvidia/Cosmos3-Nano` 16B Reasoner。离开椅子后不会调用 Cosmos3，也不做人脸识别或跨天身份关联。
 
 本扩展在 NVIDIA VSS `dev-profile-alerts` 之上增加单路 USB 摄像头、匿名办公事件分类、事件面板和内网 HTTPS 入口。VSS 核心服务保持原样，便于定位官方组件问题。
 
@@ -10,7 +12,21 @@
 - 一个可用的 NVIDIA NGC API key，以及允许下载所需模型的凭据。
 - 一台支持 1920×1080 MJPEG 或 raw 输出的 USB 摄像头。
 
-## 2. 配置
+## 2. 下载 Cosmos3-Nano 16B
+
+`.env` 中默认使用 NVIDIA 官方仓库并固定到已验证提交：
+
+```dotenv
+COSMOS3_MODEL_REPO=nvidia/Cosmos3-Nano
+COSMOS3_MODEL_REVISION=411f42a8fdfb8c5b2583cb8786e0938f49796eaa
+COSMOS3_MODEL_DIR=/home/shiyiming/models/Cosmos3-Nano
+```
+
+执行 `bash ./scripts/download-cosmos3-nano.sh` 可单独下载。模型约 32.6 GiB，断线后再次执行会自动续传；权重保存在宿主机，停止或重建容器不会重新下载。`install.sh` 默认自动执行这一步；已有完整权重时可设置 `COSMOS3_AUTO_DOWNLOAD=false`。
+
+服务使用 DGX Spark 可用的多架构 NGC vLLM 26.07 镜像，并安装 NVIDIA Cosmos3 Reasoner 插件。它监听宿主机回环地址 `127.0.0.1:8018`，不会暴露给办公网。旧 VSS `vss-rtvi-vlm` 会停止，避免两套 VLM 同时占用统一内存；RT-CV、VST、Kafka、Elasticsearch 等 VSS 服务继续使用。
+
+## 3. 配置
 
 ```bash
 cp .env.example .env
@@ -23,7 +39,9 @@ cp config/office-config.example.yaml config/office-config.yaml
 
 人数统计默认每 2 秒读取 Elasticsearch 最新的 `mdx-frames-*` 帧。人员连续 10 秒未被同一摄像头看到后记为离开；这两个值可以通过 `occupancy.poll_seconds` 和 `occupancy.departure_timeout_seconds` 调整。多摄像头环境必须填写 `camera.vss_sensor_id`，避免统计其他摄像头。
 
-## 3. 安装与验证
+安装后打开 `/office`，在“椅子 ROI 标定”中只框住椅面和正常坐姿区域。页面输出在座、专注、各行为时长、离座次数和加班时间。活动主类固定为电脑、阅读、书写、手机、交谈、休息和无法判断，模型的 `detail` 字段可补充打字、鼠标操作、喝水、整理桌面等更具体的可见动作。
+
+## 4. 安装与验证
 
 ```bash
 ./scripts/preflight.sh
@@ -38,7 +56,7 @@ cp config/office-config.example.yaml config/office-config.yaml
 
 安装脚本会尝试通过 VSS Agent API 自动注册 `rtsp://127.0.0.1:8554/office-main`。如果 VSS 启动较慢导致注册失败，可在 VSS 的 Video Management 页面手动添加同一 URL。
 
-## 4. 数据与隐私
+## 5. 数据与隐私
 
 - 不启用人脸识别，不保存人脸模板，不推断人员身份或敏感属性。
 - DeepStream 产生人员候选事件，VLM 仅验证画面中是否确有真人。
@@ -47,11 +65,11 @@ cp config/office-config.example.yaml config/office-config.yaml
 - `data/office-assistant` 保存人工确认和事件片段；本地清理线程删除超过 7 天的片段。
 - VSS Elasticsearch ILM 在部署时设置为 7 天。VIOS 的临时录像策略仍应在上线前通过 VSS 配置和磁盘检查确认。
 
-## 5. 网络安全
+## 6. 网络安全
 
 Web 入口没有登录密码。只向受信任办公网开放 HTTPS 端口（默认 8443），SSH 仅向管理员网段开放；严禁将 8443 暴露到公网。端口 7777、8000、8090、8554、9080、9200、9901、30888 和模型服务端口不得暴露给不受信任网络。宿主机防火墙因环境差异不会由安装脚本自动修改。
 
-## 6. 发布与回滚
+## 7. 发布与回滚
 
 ```bash
 git tag -a office-assistant-v0.1.0 -m 'DGX Spark office assistant v0.1.0'

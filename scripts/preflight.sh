@@ -22,8 +22,10 @@ camera_device="$(read_env CAMERA_DEVICE)"; camera_device="${camera_device:-/dev/
 [[ -c "${camera_device}" ]] || { echo "[FAIL] Camera is not a character device: ${camera_device}" >&2; errors=$((errors + 1)); }
 [[ -n "$(read_env NGC_CLI_API_KEY)" ]] || { echo "[FAIL] NGC_CLI_API_KEY is empty in .env" >&2; errors=$((errors + 1)); }
 
-available_gb="$(df -Pk "${REPO_ROOT}" | awk 'NR==2 {printf "%d", $4/1024/1024}')"
-[[ "${available_gb}" -ge 30 ]] || { echo "[FAIL] At least 30 GB free disk is required; found ${available_gb} GB" >&2; errors=$((errors + 1)); }
+model_dir="$(read_env COSMOS3_MODEL_DIR)"; model_dir="${model_dir:-${HOME}/models/Cosmos3-Nano}"
+model_parent="$(dirname -- "${model_dir}")"; mkdir -p "${model_parent}"
+available_gb="$(df -Pk "${model_parent}" | awk 'NR==2 {printf "%d", $4/1024/1024}')"
+[[ "${available_gb}" -ge 40 || -f "${model_dir}/config.json" ]] || { echo "[FAIL] Cosmos3-Nano needs 40 GB free for its initial download; found ${available_gb} GB" >&2; errors=$((errors + 1)); }
 
 docker compose --env-file "${OFFICE_ENV}" -f "${OFFICE_COMPOSE}" config --quiet \
   || { echo "[FAIL] Office Compose configuration is invalid" >&2; errors=$((errors + 1)); }

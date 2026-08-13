@@ -17,6 +17,7 @@ import urllib.request
 from contextlib import closing
 from datetime import datetime
 from datetime import time as datetime_time
+from datetime import timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -25,6 +26,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import yaml
+
+from workstation import WorkstationEngine
+from workstation import default_config as default_workstation_config
+from workstation import initialize_schema as initialize_workstation_schema
+from workstation import validate_workstation_config
+from workstation import worker as workstation_worker
 
 CONFIG_FILE = Path(os.environ.get("OFFICE_CONFIG_FILE", "/config/office-config.yaml"))
 DATABASE_FILE = Path(os.environ.get("OFFICE_DATABASE_FILE", "/data/office.db"))
@@ -46,6 +53,7 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
         raise ConfigurationError("configuration root must be a mapping")
     if not raw.get("timezone"):
         raise ConfigurationError("missing required field: timezone")
+    raw.setdefault("workstation", default_workstation_config())
     try:
         ZoneInfo(str(raw["timezone"]))
     except (KeyError, ValueError) as error:
@@ -77,6 +85,10 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
             raise ConfigurationError(f"zone {zone.get('id', '<unknown>')} needs at least three points")
         if any(len(point) != 2 or any(float(value) < 0 or float(value) > 1 for value in point) for point in polygon):
             raise ConfigurationError("zone coordinates must be normalized into [0, 1]")
+    try:
+        validate_workstation_config(raw)
+    except ValueError as error:
+        raise ConfigurationError(str(error)) from error
     return raw
 
 
@@ -100,6 +112,7 @@ def initialize_database() -> None:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS occupancy_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
+    initialize_workstation_schema(DATABASE_FILE)
 
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
@@ -453,6 +466,21 @@ class OfficeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_bytes(self, status: int, body: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self, maximum: int = 65536) -> dict[str, Any]:
+        length = min(int(self.headers.get("Content-Length", "0")), maximum)
+        payload = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         try:
@@ -475,6 +503,29 @@ class OfficeHandler(BaseHTTPRequestHandler):
                     HTTPStatus.OK,
                     occupancy_snapshot(self.server.office_config),  # type: ignore[attr-defined]
                 )
+            elif parsed.path == "/api/workstation/live":
+                self.send_json(HTTPStatus.OK, self.server.workstation.live())  # type: ignore[attr-defined]
+            elif parsed.path == "/api/workstation/reports":
+                query = urllib.parse.parse_qs(parsed.query)
+                timezone = ZoneInfo(self.server.office_config["timezone"])  # type: ignore[attr-defined]
+                today = datetime.now(timezone).date()
+                start = datetime.fromisoformat(query.get("start", [(today - timedelta(days=6)).isoformat()])[0]).date()
+                end = datetime.fromisoformat(query.get("end", [today.isoformat()])[0]).date()
+                self.send_json(HTTPStatus.OK, {"reports": self.server.workstation.reports(start, end)})  # type: ignore[attr-defined]
+            elif parsed.path.startswith("/api/workstation/reports/"):
+                report_date = datetime.fromisoformat(parsed.path.rsplit("/", 1)[-1]).date()
+                self.send_json(HTTPStatus.OK, self.server.workstation.report(report_date))  # type: ignore[attr-defined]
+            elif parsed.path == "/api/workstation/roi":
+                self.send_json(HTTPStatus.OK, self.server.workstation.roi())  # type: ignore[attr-defined]
+            elif parsed.path == "/api/workstation/frame":
+                self.send_bytes(HTTPStatus.OK, self.server.workstation.current_picture(), "image/jpeg")  # type: ignore[attr-defined]
+            elif parsed.path.startswith("/api/workstation/events/") and parsed.path.endswith("/clip"):
+                event_id = int(parsed.path.removeprefix("/api/workstation/events/").removesuffix("/clip").strip("/"))
+                clip = self.server.workstation.event_clip(event_id)  # type: ignore[attr-defined]
+                if clip:
+                    self.send_static(clip, "video/mp4")
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "workstation event clip not ready"})
             elif parsed.path == "/api/events":
                 self.send_json(
                     HTTPStatus.OK,
@@ -528,6 +579,20 @@ class OfficeHandler(BaseHTTPRequestHandler):
             )
         self.send_json(HTTPStatus.OK, {"event_id": event_id, "acknowledged_at": acknowledged_at, "note": note})
 
+    def do_PUT(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        try:
+            if parsed.path != "/api/workstation/roi":
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            payload = self.read_json()
+            polygon = payload.get("chair_roi")
+            if not isinstance(polygon, list):
+                raise ValueError("chair_roi must be a polygon array")
+            self.send_json(HTTPStatus.OK, self.server.workstation.save_roi(polygon))  # type: ignore[attr-defined]
+        except (ConfigurationError, ValueError, OSError, json.JSONDecodeError) as error:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+
     def log_message(self, message_format: str, *args: Any) -> None:
         print(f"[office-api] {self.address_string()} {message_format % args}", flush=True)
 
@@ -538,9 +603,16 @@ def main() -> None:
     cleanup_expired_clips(config)
     threading.Thread(target=maintenance_worker, args=(config,), daemon=True).start()
     threading.Thread(target=occupancy_worker, args=(config,), daemon=True).start()
+    workstation = WorkstationEngine(config, DATABASE_FILE, CONFIG_FILE, ELASTICSEARCH_URL, VSS_VST_URL)
+    threading.Thread(
+        target=workstation_worker,
+        args=(workstation, lambda: fetch_latest_frame(config), float(config["occupancy"].get("poll_seconds", 2))),
+        daemon=True,
+    ).start()
     port = int(os.environ.get("OFFICE_API_PORT", "8090"))
     server = ThreadingHTTPServer(("127.0.0.1", port), OfficeHandler)
     server.office_config = config  # type: ignore[attr-defined]
+    server.workstation = workstation  # type: ignore[attr-defined]
     print(f"[office-api] listening on http://127.0.0.1:{port}", flush=True)
     server.serve_forever()
 

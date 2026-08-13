@@ -16,6 +16,27 @@ occupancy:
   minimum_person_confidence: 0.3
   history_limit: 100
 
+workstation:
+  enabled: true
+  id: desk-main
+  name: Main Workstation
+  # Normalized polygon covering only the chair/seat. Calibrate it in the Web UI.
+  chair_roi:
+    - [0.35, 0.25]
+    - [0.75, 0.25]
+    - [0.75, 0.95]
+    - [0.35, 0.95]
+  sample_seconds: 20
+  departure_seconds: 60
+  state_confirmation_samples: 2
+  frame_stale_seconds: 15
+  focused_activities: [computer, reading, writing]
+  activities: [computer, reading, writing, phone, conversation, rest, unknown]
+  cosmos3_url: http://127.0.0.1:8018
+  cosmos3_model: auto
+  report_retention_days: 365
+  event_clip_retention_days: 7
+
 schedule:
   weekdays: [monday, tuesday, wednesday, thursday, friday]
   start: "09:00"

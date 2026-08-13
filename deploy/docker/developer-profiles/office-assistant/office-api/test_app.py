@@ -17,6 +17,15 @@ camera: {rtsp_url: 'rtsp://127.0.0.1:8554/office-main'}
 occupancy: {poll_seconds: 2, departure_timeout_seconds: 10, minimum_person_confidence: 0.3, history_limit: 100}
 schedule: {weekdays: [monday], start: '09:00', end: '18:00'}
 retention: {event_days: 7}
+workstation:
+  chair_roi: [[0.3, 0.2], [0.8, 0.2], [0.8, 0.95], [0.3, 0.95]]
+  sample_seconds: 20
+  departure_seconds: 60
+  state_confirmation_samples: 2
+  activities: [computer, reading, writing, phone, conversation, rest, unknown]
+  focused_activities: [computer, reading, writing]
+  report_retention_days: 365
+  cosmos3_url: http://127.0.0.1:8018
 rules:
   after_hours_presence: {enabled: true}
   restricted_zone_entry: {enabled: true}

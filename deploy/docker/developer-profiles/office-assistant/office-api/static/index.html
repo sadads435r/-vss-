@@ -2,128 +2,60 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>智能办公助手</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>单工位专注助手</title>
   <style>
-    :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; background: #0b0e14; color: #eef2f6; }
-    body { margin: 0; padding: 32px; }
-    header { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
-    h2 { margin-top: 32px; }
-    a { color: #76b900; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin: 16px 0 24px; }
-    .card, table { background: #151a23; border: 1px solid #2a3240; border-radius: 10px; }
-    .card { padding: 16px; }
-    .metric { font-size: 36px; font-weight: 700; margin: 8px 0 0; }
-    .muted { color: #9aa5b4; }
-    .ok { color: #76b900; }
-    .bad { color: #ff6b6b; }
-    table { width: 100%; border-collapse: collapse; overflow: hidden; }
-    th, td { padding: 12px; border-bottom: 1px solid #2a3240; text-align: left; }
-    button { background: #76b900; border: 0; border-radius: 6px; padding: 8px 12px; cursor: pointer; }
-    .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: currentColor; }
+    :root{color-scheme:dark;font-family:Inter,"Microsoft YaHei",sans-serif;background:#0b0e14;color:#eef2f6}
+    *{box-sizing:border-box}body{margin:0;padding:28px;max-width:1500px;margin:auto}header{display:flex;justify-content:space-between;align-items:center;gap:16px}h1,h2{margin:0 0 14px}h2{margin-top:30px;font-size:20px}a{color:#8bd000}.muted{color:#9aa5b4}.ok{color:#8bd000}.bad{color:#ff6b6b}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;margin:18px 0}.card,.panel{background:#151a23;border:1px solid #2a3240;border-radius:12px;padding:16px}.metric{font-size:30px;font-weight:750;margin-top:8px}.wide{grid-column:span 2}
+    table{width:100%;border-collapse:collapse;background:#151a23;border:1px solid #2a3240;border-radius:12px;overflow:hidden}th,td{padding:11px;border-bottom:1px solid #2a3240;text-align:left}button,input{font:inherit;border-radius:7px;padding:8px 11px}button{border:0;background:#76b900;color:#081006;font-weight:700;cursor:pointer}input{border:1px solid #384354;background:#0f131b;color:#eef2f6}
+    .bar{display:flex;height:25px;border-radius:6px;overflow:hidden;background:#202734}.bar span{min-width:2px}.timeline{display:flex;gap:2px;height:32px}.timeline div{border-radius:4px;min-width:3px}.legend{display:flex;gap:12px;flex-wrap:wrap;margin:10px 0}.dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px}
+    #roi-wrap{position:relative;display:inline-block;max-width:100%}#frame{max-width:100%;max-height:600px;display:block}#roi{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}.hidden{display:none}
+    @media(max-width:700px){body{padding:16px}.wide{grid-column:span 1}header{align-items:flex-start;flex-direction:column}}
   </style>
 </head>
 <body>
-  <header>
-    <div><h1>智能办公助手</h1><p class="muted">匿名人数、进出时间与安防事件</p></div>
-    <a href="/">打开 VSS 聊天</a>
-  </header>
-
+  <header><div><h1>单工位专注助手</h1><div class="muted">匿名工位分析 · 行为由模型估计，仅供个人时间复盘</div></div><a href="/">打开 VSS 聊天</a></header>
   <section class="grid">
-    <div class="card"><div class="muted">当前正在办公（画面可见）</div><div id="current-count" class="metric">--</div></div>
-    <div class="card"><div class="muted">今日到访记录</div><div id="today-count" class="metric">--</div></div>
-    <div class="card"><div class="muted">摄像头数据</div><div id="camera-state" class="metric">--</div><small id="data-age" class="muted"></small></div>
+    <div class="card"><div class="muted">当前状态</div><div id="activity" class="metric">--</div><small id="activity-detail" class="muted"></small></div>
+    <div class="card"><div class="muted">今日在座</div><div id="seated" class="metric">--</div></div>
+    <div class="card"><div class="muted">今日专注</div><div id="focused" class="metric">--</div></div>
+    <div class="card"><div class="muted">专注率</div><div id="focus-rate" class="metric">--</div></div>
+    <div class="card"><div class="muted">离座次数</div><div id="away-count" class="metric">--</div></div>
+    <div class="card"><div class="muted">加班时长</div><div id="overtime" class="metric">--</div></div>
   </section>
 
-  <h2>正在办公</h2>
-  <table>
-    <thead><tr><th>匿名编号</th><th>出现时间</th><th>已停留</th><th>摄像头</th><th>状态</th></tr></thead>
-    <tbody id="active-people"></tbody>
-  </table>
+  <h2>今日行为分布</h2><section class="panel"><div id="health" class="legend"></div><div id="activity-bar" class="bar"></div><div id="activity-legend" class="legend"></div><div id="timeline" class="timeline"></div></section>
 
-  <h2>今日进出记录</h2>
-  <table>
-    <thead><tr><th>匿名编号</th><th>出现时间</th><th>离开时间</th><th>停留时长</th><th>状态</th></tr></thead>
-    <tbody id="presence-history"></tbody>
-  </table>
+  <h2>历史日报</h2>
+  <div class="controls"><label>开始 <input id="start" type="date"></label><label>结束 <input id="end" type="date"></label><button onclick="loadReports()">查询</button></div>
+  <table><thead><tr><th>日期</th><th>在座</th><th>专注</th><th>专注率</th><th>离座</th><th>加班</th><th>首次到岗</th><th>最后离岗</th></tr></thead><tbody id="reports"></tbody></table>
 
-  <h2>系统状态</h2>
-  <section id="status" class="grid"></section>
+  <h2>椅子 ROI 标定</h2>
+  <section class="panel"><p class="muted">点击画面左上角和右下角，只框住椅子/坐姿区域；路过人员应位于框外。</p><div id="roi-wrap"><img id="frame" alt="摄像头当前帧"><canvas id="roi"></canvas></div><div class="controls"><button onclick="reloadFrame()">刷新画面</button><button onclick="resetRoi()">重新画框</button><button onclick="saveRoi()">保存 ROI</button><span id="roi-message" class="muted"></span></div></section>
 
-  <h2>办公事件</h2>
-  <table>
-    <thead><tr><th>时间</th><th>类型</th><th>摄像头</th><th>状态</th><th>操作</th></tr></thead>
-    <tbody id="events"></tbody>
-  </table>
-
-  <script>
-    const api = '/office-api';
-    const esc = value => String(value ?? '').replace(/[&<>"']/g, character => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[character]));
-    const formatTime = seconds => seconds ? new Date(seconds * 1000).toLocaleString('zh-CN', {hour12: false}) : '—';
-    const formatDuration = seconds => {
-      const total = Math.max(0, Math.round(seconds || 0));
-      const hours = Math.floor(total / 3600);
-      const minutes = Math.floor((total % 3600) / 60);
-      const remainder = total % 60;
-      return `${hours ? `${hours}小时 ` : ''}${minutes ? `${minutes}分 ` : ''}${remainder}秒`;
-    };
-    const personLabel = trackId => `人员 ${esc(trackId)}`;
-
-    async function refreshOccupancy() {
-      try {
-        const data = await fetch(`${api}/api/occupancy/current`, {cache: 'no-store'}).then(response => response.json());
-        document.querySelector('#current-count').textContent = data.current_count ?? 0;
-        document.querySelector('#today-count').textContent = data.today_session_count ?? 0;
-        document.querySelector('#camera-state').textContent = data.camera_online ? '在线' : '离线';
-        document.querySelector('#camera-state').className = `metric ${data.camera_online ? 'ok' : 'bad'}`;
-        document.querySelector('#data-age').textContent = data.data_age_seconds == null ? '尚未收到人员帧数据' : `数据延迟 ${data.data_age_seconds} 秒`;
-        const now = Date.now() / 1000;
-        document.querySelector('#active-people').innerHTML = (data.active_people || []).map(person => `
-          <tr><td>${personLabel(person.track_id)}</td><td>${formatTime(person.arrived_at)}</td>
-          <td>${formatDuration(now - person.arrived_at)}</td><td>${esc(person.camera_id)}</td>
-          <td class="ok"><span class="status-dot"></span>正在办公</td></tr>
-        `).join('') || '<tr><td colspan="5">当前没有检测到人员</td></tr>';
-        document.querySelector('#presence-history').innerHTML = (data.history || []).map(session => `
-          <tr><td>${personLabel(session.track_id)}</td><td>${formatTime(session.arrived_at)}</td>
-          <td>${formatTime(session.left_at)}</td><td>${formatDuration(session.duration_seconds)}</td>
-          <td class="${session.status === 'working' ? 'ok' : 'muted'}">${session.status === 'working' ? '正在办公' : '已离开'}</td></tr>
-        `).join('') || '<tr><td colspan="5">今天还没有人员记录</td></tr>';
-      } catch (error) {
-        document.querySelector('#camera-state').textContent = '异常';
-        document.querySelector('#camera-state').className = 'metric bad';
-        document.querySelector('#data-age').textContent = String(error);
-      }
-    }
-
-    async function refreshSlowData() {
-      const [status, eventData] = await Promise.all([
-        fetch(`${api}/api/status`, {cache: 'no-store'}).then(response => response.json()),
-        fetch(`${api}/api/events?limit=50`, {cache: 'no-store'}).then(response => response.json()).catch(error => ({events: [], error: String(error)}))
-      ]);
-      document.querySelector('#status').innerHTML = Object.entries(status).map(([name, state]) => `
-        <div class="card"><strong>${esc(name)}</strong><p class="${state.healthy ? 'ok' : 'bad'}">${state.healthy ? '正常' : '不可用'}</p></div>
-      `).join('');
-      document.querySelector('#events').innerHTML = (eventData.events || []).map(event => {
-        const id = encodeURIComponent(event.event_id);
-        return `<tr><td>${esc(event['@timestamp'] || event.timestamp)}</td>
-          <td>${esc(event.office_event_type || event.category || event.type)}</td>
-          <td>${esc(event.sensorId || event.camera_id)}</td>
-          <td>${event.acknowledgement ? '已确认' : '待处理'}</td>
-          <td><a href="${api}/api/events/${id}/clip" target="_blank">片段</a> <button onclick="ack('${id}')">确认</button></td></tr>`;
-      }).join('') || '<tr><td colspan="5">暂无事件或 Elasticsearch 尚未就绪</td></tr>';
-    }
-
-    async function ack(id) {
-      await fetch(`${api}/api/events/${id}/acknowledge`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
-      refreshSlowData();
-    }
-
-    refreshOccupancy();
-    refreshSlowData();
-    setInterval(refreshOccupancy, 2000);
-    setInterval(refreshSlowData, 15000);
-  </script>
-</body>
-</html>
+<script>
+const api='/office-api';
+const colors={computer:'#76b900',reading:'#25b7d3',writing:'#8b7cff',phone:'#ff9f43',conversation:'#ef6caa',rest:'#9aa5b4',unknown:'#4d5766'};
+const labels={computer:'电脑操作',reading:'阅读',writing:'书写',phone:'使用手机',conversation:'交谈',rest:'休息',unknown:'无法判断'};
+const duration=s=>{s=Math.max(0,Math.round(s||0));const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?(h+'小时'+m+'分'):(m+'分'+(s%60)+'秒')};
+const clock=s=>s?new Date(s*1000).toLocaleTimeString('zh-CN',{hour12:false,hour:'2-digit',minute:'2-digit'}):'--';
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function json(url,options){const r=await fetch(url,{cache:'no-store',...options});const d=await r.json();if(!r.ok)throw new Error(d.error||r.statusText);return d}
+function renderReport(r){
+  document.querySelector('#seated').textContent=duration(r.seated_seconds);document.querySelector('#focused').textContent=duration(r.focused_seconds);document.querySelector('#focus-rate').textContent=`${r.focus_rate}%`;document.querySelector('#away-count').textContent=r.away_count;document.querySelector('#overtime').textContent=duration(r.overtime_seconds);
+  const total=Math.max(1,Object.values(r.activity_seconds).reduce((a,b)=>a+b,0));document.querySelector('#activity-bar').innerHTML=Object.entries(r.activity_seconds).filter(([,v])=>v).map(([k,v])=>`<span title="${labels[k]} ${duration(v)}" style="width:${v/total*100}%;background:${colors[k]}"></span>`).join('');
+  document.querySelector('#activity-legend').innerHTML=Object.entries(r.activity_seconds).map(([k,v])=>`<span><i class="dot" style="background:${colors[k]}"></i>${labels[k]} ${duration(v)}</span>`).join('');
+  const first=r.timeline[0]?.started_at||0,last=r.timeline.at(-1)?.ended_at||first+1,span=Math.max(1,last-first);document.querySelector('#timeline').innerHTML=r.timeline.map(x=>`<div title="${labels[x.activity]} ${clock(x.started_at)}-${clock(x.ended_at)}" style="background:${colors[x.activity]};width:${(x.ended_at-x.started_at)/span*100}%"></div>`).join('');
+}
+async function refresh(){const activityNode=document.querySelector('#activity');try{const d=await json(`${api}/api/workstation/live`);activityNode.textContent=d.activity_label;activityNode.className=`metric ${d.occupied?'ok':''}`;document.querySelector('#activity-detail').textContent=d.occupied?((d.activity_detail?d.activity_detail+'·':'')+`连续在座 ${duration(d.continuous_seated_seconds)}`):'椅子当前无人';renderReport(d.today);document.querySelector('#health').innerHTML=[['摄像头',d.camera_online],['RT-CV',d.rtcv_healthy],['Cosmos3',d.vlm_healthy]].map(([n,v])=>`<span class="${v?'ok':'bad'}">● ${n} ${v?'正常':'异常'}</span>`).join('')}catch(e){activityNode.textContent='数据异常';activityNode.className='metric bad';document.querySelector('#activity-detail').textContent=e}}
+async function loadReports(){const startNode=document.querySelector('#start'),endNode=document.querySelector('#end'),body=document.querySelector('#reports');const d=await json(`${api}/api/workstation/reports?start=${startNode.value}&end=${endNode.value}`);body.innerHTML=d.reports.reverse().map(r=>`<tr><td>${r.date}</td><td>${duration(r.seated_seconds)}</td><td>${duration(r.focused_seconds)}</td><td>${r.focus_rate}%</td><td>${r.away_count}次 / ${duration(r.away_seconds)}</td><td>${duration(r.overtime_seconds)}</td><td>${clock(r.first_arrival_at)}</td><td>${clock(r.last_departure_at)}</td></tr>`).join('')||'<tr><td colspan="8">暂无数据</td></tr>'}
+const img=document.querySelector('#frame'),canvas=document.querySelector('#roi'),ctx=canvas.getContext('2d');let roi=[],clicks=[];
+function draw(){canvas.width=img.clientWidth;canvas.height=img.clientHeight;ctx.clearRect(0,0,canvas.width,canvas.height);if(roi.length){ctx.strokeStyle='#76b900';ctx.lineWidth=3;ctx.fillStyle='#76b90033';ctx.beginPath();roi.forEach((p,i)=>(i?ctx.lineTo(...p):ctx.moveTo(...p)));ctx.closePath();ctx.fill();ctx.stroke()}}
+async function reloadFrame(){img.src=`${api}/api/workstation/frame?t=${Date.now()}`;img.onload=draw}function resetRoi(){roi=[];clicks=[];draw();document.querySelector('#roi-message').textContent='请点击左上角和右下角'}
+canvas.onclick=e=>{if(clicks.length>=2)return;const rect=canvas.getBoundingClientRect();clicks.push([(e.clientX-rect.left)/rect.width,(e.clientY-rect.top)/rect.height]);if(clicks.length===2){const a=clicks[0],b=clicks[1],l=Math.min(a[0],b[0]),r=Math.max(a[0],b[0]),t=Math.min(a[1],b[1]),bt=Math.max(a[1],b[1]);roi=[[l*canvas.width,t*canvas.height],[r*canvas.width,t*canvas.height],[r*canvas.width,bt*canvas.height],[l*canvas.width,bt*canvas.height]];draw()}};
+async function loadRoi(){const d=await json(`${api}/api/workstation/roi`);roi=d.chair_roi.map(p=>[p[0]*img.clientWidth,p[1]*img.clientHeight]);draw()}
+async function saveRoi(){if(roi.length<3)return document.querySelector('#roi-message').textContent='请先画框';const normalized=roi.map(p=>[Number((p[0]/canvas.width).toFixed(4)),Number((p[1]/canvas.height).toFixed(4))]);await json(`${api}/api/workstation/roi`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({chair_roi:normalized})});document.querySelector('#roi-message').textContent='已保存'}
+const today=new Date(),week=new Date(Date.now()-6*86400000);document.querySelector('#end').value=today.toISOString().slice(0,10);document.querySelector('#start').value=week.toISOString().slice(0,10);refresh();loadReports();reloadFrame();setTimeout(loadRoi,1000);setInterval(refresh,5000);window.onresize=draw;
+</script>
+</body></html>
