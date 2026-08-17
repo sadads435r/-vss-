@@ -95,7 +95,9 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
 def initialize_database() -> None:
     DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=30)) as connection, connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
         connection.execute(
             "CREATE TABLE IF NOT EXISTS acknowledgements "
             "(event_id TEXT PRIMARY KEY, acknowledged_at INTEGER NOT NULL, note TEXT NOT NULL DEFAULT '')"
@@ -136,19 +138,82 @@ def parse_timestamp(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
+def parse_activity_window(
+    query: dict[str, list[str]], timezone: ZoneInfo, now: float | None = None,
+) -> tuple[float, float]:
+    """Parse a local date or an ISO date/datetime range into epoch seconds."""
+    current = time.time() if now is None else now
+    if query.get("date"):
+        try:
+            day = datetime.fromisoformat(query["date"][0]).date()
+        except ValueError as error:
+            raise ValueError("date must use ISO format YYYY-MM-DD") from error
+        start = datetime.combine(day, datetime_time.min, timezone)
+        end = start + timedelta(days=1)
+    else:
+        today = datetime.fromtimestamp(current, timezone).date()
+        start_value = query.get("start", [today.isoformat()])[0]
+        end_value = query.get("end", [today.isoformat()])[0]
+
+        def boundary(value: str, *, end_boundary: bool) -> datetime:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ValueError("start and end must be ISO dates or datetimes") from error
+            is_date = len(value) == 10
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone)
+            if is_date and end_boundary:
+                parsed += timedelta(days=1)
+            return parsed
+
+        start = boundary(start_value, end_boundary=False)
+        end = boundary(end_value, end_boundary=True)
+    if end <= start:
+        raise ValueError("end must be after start")
+    if end - start > timedelta(days=366):
+        raise ValueError("activity query range cannot exceed 366 days")
+    return start.timestamp(), end.timestamp()
+
+
 def fetch_latest_frame(config: dict[str, Any]) -> dict[str, Any] | None:
-    sensor_id = str(config["camera"].get("vss_sensor_id", "")).strip()
-    query: dict[str, Any] = {"match_all": {}}
+    # mdx-raw 的 sensorId 是相机名（如 office-main）；vss_sensor_id 是 VST 的 UUID，不能用于 ES 过滤
+    sensor_id = str(config["camera"].get("id", "")).strip()
+    # 帧数据源为 mdx-raw-*（RT-CV 检测事件经 Kafka/ES 落库），排除 1970 占位空消息
     if sensor_id:
-        query = {"term": {"sensorId.keyword": sensor_id}}
+        query: dict[str, Any] = {
+            "bool": {
+                "must": [{"term": {"sensorId.keyword": sensor_id}}],
+                "filter": [{"range": {"timestamp": {"gt": "2020-01-01T00:00:00Z"}}}],
+            }
+        }
+    else:
+        query = {
+            "bool": {
+                "must": [{"match_all": {}}],
+                "filter": [{"range": {"timestamp": {"gt": "2020-01-01T00:00:00Z"}}}],
+            }
+        }
     payload = {
-        "size": 1,
+        "size": 8,
         "sort": [{"timestamp": {"order": "desc", "unmapped_type": "date"}}],
         "query": query,
     }
-    result = request_json(f"{ELASTICSEARCH_URL}/mdx-frames-*/_search", method="POST", payload=payload)
+    result = request_json(f"{ELASTICSEARCH_URL}/mdx-raw-*/_search", method="POST", payload=payload)
     hits = result.get("hits", {}).get("hits", [])
-    return dict(hits[0].get("_source", {})) if hits else None
+    if not hits:
+        return None
+    # RT-CV 事件成对落库（sentinel conf=-0.1 帧 + 真实置信度帧），同刻多条排序不稳定。
+    # 优先返回带真实 person 置信度（>0）的帧，避免随机取到 sentinel 帧导致占用判定抖动。
+    for hit in hits:
+        source = hit.get("_source", {})
+        for obj in source.get("objects", []):
+            if str(obj.get("type", "")).casefold() == "person":
+                conf = float(obj.get("confidence", -1))
+                bbox_conf = float((obj.get("bbox") or {}).get("confidence", -1))
+                if max(conf, bbox_conf) > 0:
+                    return dict(source)
+    return dict(hits[0].get("_source", {}))
 
 
 def extract_people(frame: dict[str, Any], minimum_confidence: float) -> dict[str, float]:
@@ -166,7 +231,7 @@ def extract_people(frame: dict[str, Any], minimum_confidence: float) -> dict[str
 def update_presence(frame: dict[str, Any] | None, config: dict[str, Any], now: float | None = None) -> None:
     current_time = time.time() if now is None else now
     timeout = float(config["occupancy"].get("departure_timeout_seconds", 10))
-    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=30)) as connection, connection:
         if frame:
             frame_token = f"{frame.get('sensorId', '')}:{frame.get('id', '')}:{frame.get('timestamp', '')}"
             previous = connection.execute(
@@ -218,7 +283,7 @@ def occupancy_snapshot(config: dict[str, Any], now: float | None = None) -> dict
     local_now = datetime.fromtimestamp(current_time, timezone)
     day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     history_limit = min(max(int(config["occupancy"].get("history_limit", 100)), 1), 500)
-    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=30)) as connection, connection:
         active_rows = connection.execute(
             "SELECT session_id, camera_id, track_id, arrived_at, last_seen_at "
             "FROM presence_sessions WHERE left_at IS NULL AND last_seen_at >= ? ORDER BY arrived_at",
@@ -271,7 +336,7 @@ def acknowledgements(event_ids: list[str]) -> dict[str, dict[str, Any]]:
     if not event_ids:
         return {}
     placeholders = ",".join("?" for _ in event_ids)
-    with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+    with closing(sqlite3.connect(DATABASE_FILE, timeout=30)) as connection, connection:
         rows = connection.execute(
             f"SELECT event_id, acknowledged_at, note FROM acknowledgements WHERE event_id IN ({placeholders})",
             event_ids,
@@ -440,9 +505,9 @@ def occupancy_worker(config: dict[str, Any]) -> None:
         frame = None
         try:
             frame = fetch_latest_frame(config)
-        except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError) as error:
+            update_presence(frame, config)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, ValueError, sqlite3.Error) as error:
             print(f"[office-api] occupancy frame poll failed: {error}", flush=True)
-        update_presence(frame, config)
         time.sleep(poll_seconds)
 
 
@@ -505,6 +570,29 @@ class OfficeHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/workstation/live":
                 self.send_json(HTTPStatus.OK, self.server.workstation.live())  # type: ignore[attr-defined]
+            elif parsed.path == "/api/person/activity/today":
+                self.send_json(HTTPStatus.OK, self.server.workstation.person_activity_today())  # type: ignore[attr-defined]
+            elif parsed.path == "/api/activity/events":
+                query = urllib.parse.parse_qs(parsed.query)
+                timezone = ZoneInfo(self.server.office_config["timezone"])  # type: ignore[attr-defined]
+                start, end = parse_activity_window(query, timezone)
+                person_id = int(query["person_id"][0]) if query.get("person_id") else None
+                search = str(query.get("q", [""])[0])[:200]
+                self.send_json(
+                    HTTPStatus.OK,
+                    self.server.workstation.activity_events(  # type: ignore[attr-defined]
+                        start, end, person_id=person_id, query=search,
+                    ),
+                )
+            elif parsed.path == "/api/people":
+                self.send_json(HTTPStatus.OK, {"people": self.server.workstation.people_list()})  # type: ignore[attr-defined]
+            elif parsed.path.startswith("/api/people/") and parsed.path.endswith("/image"):
+                person_id = int(parsed.path.removeprefix("/api/people/").removesuffix("/image").strip("/"))
+                image = self.server.workstation.person_image(person_id)  # type: ignore[attr-defined]
+                if image:
+                    self.send_static(image, "image/jpeg")
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "person image not found"})
             elif parsed.path == "/api/workstation/reports":
                 query = urllib.parse.parse_qs(parsed.query)
                 timezone = ZoneInfo(self.server.office_config["timezone"])  # type: ignore[attr-defined]
@@ -559,7 +647,7 @@ class OfficeHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except (ConfigurationError, ValueError) as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
-        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, sqlite3.Error) as error:
             self.send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -572,7 +660,7 @@ class OfficeHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         note = str(payload.get("note", ""))[:1000]
         acknowledged_at = int(time.time())
-        with closing(sqlite3.connect(DATABASE_FILE)) as connection, connection:
+        with closing(sqlite3.connect(DATABASE_FILE, timeout=30)) as connection, connection:
             connection.execute(
                 "INSERT OR REPLACE INTO acknowledgements(event_id, acknowledged_at, note) VALUES (?, ?, ?)",
                 (event_id, acknowledged_at, note),
@@ -582,16 +670,36 @@ class OfficeHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         try:
-            if parsed.path != "/api/workstation/roi":
-                self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            if parsed.path == "/api/workstation/roi":
+                payload = self.read_json()
+                polygon = payload.get("chair_roi")
+                if not isinstance(polygon, list):
+                    raise ValueError("chair_roi must be a polygon array")
+                self.send_json(HTTPStatus.OK, self.server.workstation.save_roi(polygon))  # type: ignore[attr-defined]
                 return
-            payload = self.read_json()
-            polygon = payload.get("chair_roi")
-            if not isinstance(polygon, list):
-                raise ValueError("chair_roi must be a polygon array")
-            self.send_json(HTTPStatus.OK, self.server.workstation.save_roi(polygon))  # type: ignore[attr-defined]
+            if parsed.path.startswith("/api/people/") and parsed.path.endswith("/name"):
+                person_id = int(parsed.path.removeprefix("/api/people/").removesuffix("/name").strip("/"))
+                payload = self.read_json()
+                name = str(payload.get("name", ""))
+                if not self.server.workstation.rename_person(person_id, name):  # type: ignore[attr-defined]
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "person not found or empty name"})
+                    return
+                self.send_json(HTTPStatus.OK, {"person_id": person_id, "name": name})
+                return
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
         except (ConfigurationError, ValueError, OSError, json.JSONDecodeError) as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/api/people/"):
+            person_id = int(parsed.path.removeprefix("/api/people/").strip("/"))
+            if self.server.workstation.delete_person(person_id):  # type: ignore[attr-defined]
+                self.send_json(HTTPStatus.OK, {"person_id": person_id, "deleted": True})
+            else:
+                self.send_json(HTTPStatus.NOT_FOUND, {"error": "person not found"})
+            return
+        self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def log_message(self, message_format: str, *args: Any) -> None:
         print(f"[office-api] {self.address_string()} {message_format % args}", flush=True)

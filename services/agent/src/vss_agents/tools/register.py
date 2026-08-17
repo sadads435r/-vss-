@@ -22,6 +22,8 @@ from . import lvs_config_media
 from . import lvs_stream_understanding
 from . import lvs_video_understanding
 from . import multi_incident_formatter
+from . import office_activity_query
+from . import office_people_count
 from . import prompt_gen
 from . import report_gen
 from . import rtvi_vlm_alert
@@ -45,6 +47,8 @@ __all__ = [
     "lvs_stream_understanding",
     "lvs_video_understanding",
     "multi_incident_formatter",
+    "office_activity_query",
+    "office_people_count",
     "prompt_gen",
     "python_executor",
     "report_gen",

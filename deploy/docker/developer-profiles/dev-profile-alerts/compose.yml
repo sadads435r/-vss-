@@ -15,6 +15,14 @@
 
 services:
 
+  # The released Agent image does not contain the office-specific tools.
+  # Mount them read-only so recreating the alerts profile keeps office queries available.
+  vss-agent:
+    volumes:
+      - ${VSS_APPS_DIR}/../../services/agent/src/vss_agents/tools/register.py:/vss-agent/.venv/lib/python3.13/site-packages/vss_agents/tools/register.py:ro
+      - ${VSS_APPS_DIR}/../../services/agent/src/vss_agents/tools/office_people_count.py:/vss-agent/.venv/lib/python3.13/site-packages/vss_agents/tools/office_people_count.py:ro
+      - ${VSS_APPS_DIR}/../../services/agent/src/vss_agents/tools/office_activity_query.py:/vss-agent/.venv/lib/python3.13/site-packages/vss_agents/tools/office_activity_query.py:ro
+
   vss-behavior-analytics-alerts:
     extends:
       file: ${VSS_APPS_DIR}/services/analytics/behavior-analytics/compose.yml
@@ -89,7 +97,7 @@ services:
       MODEL_NAME_2D: ${MODEL_NAME_2D}
       NUM_SENSORS: ${NUM_SENSORS}
       DS_MODEL_FAMILY: rtdetr-gdino
-      DS_TRACKER_REID: "false"
+      DS_TRACKER_REID: "true"
       DS_SHOW_SENSOR_ID: "true"
       DS_CONFIG_FILE: /opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/configs/run_config-api-rtdetr-protobuf.txt
     depends_on:

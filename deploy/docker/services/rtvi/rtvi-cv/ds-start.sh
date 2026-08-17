@@ -23,7 +23,7 @@ unset _ARCH
 # Shared: build extra flags from env vars
 build_extra_flags() {
     local flags=""
-    [[ "$DS_TRACKER_REID" == "true" ]] && flags="$flags --tracker-reid"
+    [[ "$DS_TRACKER_REID" == "true" ]] && flags="$flags --tracker-reid --reid-store-age 100"
     [[ "$DS_SHOW_SENSOR_ID" == "true" ]] && flags="$flags --show-sensor-id"
     echo "$flags"
 }
@@ -177,12 +177,18 @@ start_rtdetr_gdino()
     echo "##### Contents of $TRACKER_CONFIG: #####"
     cat $TRACKER_CONFIG
 
+    # Enable ReID embedding output so --tracker-reid can attach person appearance
+    # vectors to mdx-raw messages (reidType is already 2 in the image-provided yml).
+    grep -q "outputReidTensor" "$TRACKER_CONFIG" || \
+        sed -i '/^[[:space:]]*reidType: 2/a\  outputReidTensor: 1' "$TRACKER_CONFIG"
+
     cat "$config_file"
-    echo "Application starting with this command: ./metropolis_perception_app -c "$config_file" -m "$DS_MODE_FLAG" -t 0 -l 5 --message-rate "$DS_MESSAGE_RATE" --show-sensor-id"
+    extra_flags=$(build_extra_flags)
+    echo "Application starting with this command: ./metropolis_perception_app -c "$config_file" -m "$DS_MODE_FLAG" -t 0 -l 5 --message-rate "$DS_MESSAGE_RATE" $extra_flags"
     exec ./metropolis_perception_app -c "$config_file" \
         -m "$DS_MODE_FLAG" -t 0 -l 5 \
         --message-rate "$DS_MESSAGE_RATE" \
-        --show-sensor-id
+        $extra_flags
 }
 
 # ---------------------------------------------------------------------------

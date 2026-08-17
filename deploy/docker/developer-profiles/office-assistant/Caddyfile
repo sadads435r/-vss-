@@ -1,4 +1,4 @@
-:{$OFFICE_HTTPS_PORT} {
+https://10.2.0.154:{$OFFICE_HTTPS_PORT} {
     tls internal
 
     handle_path /office-api/* {

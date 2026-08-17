@@ -8,7 +8,7 @@
 
 - DGX OS 7.4、NVIDIA 驱动 580.95.05 或兼容版本。
 - Docker 28.3.3+ 且低于 29.5.0、Docker Compose 2.39.1+、NVIDIA Container Toolkit 1.17.8+。
-- `git-lfs`、`curl`、NVIDIA NGC CLI（`ngc`）、`v4l2-ctl`、至少 30 GB 可用空间。
+- `git-lfs`、`curl`、NVIDIA NGC CLI（`ngc`）、`v4l2-ctl`；首次下载模型至少预留 40 GiB 可用空间。
 - 一个可用的 NVIDIA NGC API key，以及允许下载所需模型的凭据。
 - 一台支持 1920×1080 MJPEG 或 raw 输出的 USB 摄像头。
 
@@ -37,9 +37,9 @@ cp config/office-config.example.yaml config/office-config.yaml
 
 编辑 `config/office-config.yaml`，确认工作时间、节假日、人数上限和 ROI。ROI 坐标以画面左上角为 `(0,0)`、右下角为 `(1,1)`。示例 ROI 只是占位值，正式告警前必须现场标定。
 
-人数统计默认每 2 秒读取 Elasticsearch 最新的 `mdx-frames-*` 帧。人员连续 10 秒未被同一摄像头看到后记为离开；这两个值可以通过 `occupancy.poll_seconds` 和 `occupancy.departure_timeout_seconds` 调整。多摄像头环境必须填写 `camera.vss_sensor_id`，避免统计其他摄像头。
+RT-CV 工位检测默认每 2 秒读取 Elasticsearch 最新的 `mdx-frames-*` 帧。人物框底部中心进入椅子 ROI 后立即显示在座；离开椅子超过 `workstation.departure_seconds`（默认 60 秒）才记录一次离座。多摄像头环境必须填写 `camera.vss_sensor_id`，避免统计其他摄像头。
 
-安装后打开 `/office`，在“椅子 ROI 标定”中只框住椅面和正常坐姿区域。页面输出在座、专注、各行为时长、离座次数和加班时间。活动主类固定为电脑、阅读、书写、手机、交谈、休息和无法判断，模型的 `detail` 字段可补充打字、鼠标操作、喝水、整理桌面等更具体的可见动作。
+安装后打开 `/office`，首页按日期和人员展示连续活动时间线，可用关键词筛选。展开“人员与摄像头设置”，在“椅子 ROI 标定”中只框住椅面和正常坐姿区域。活动主类固定为电脑、阅读、书写、手机、交谈、吃东西、休息和无法判断；模型只生成画面证据支持的简短描述，不推测屏幕内容或业务目的。相同事件会持续延长，只有连续两次确认变化才会拆分成新的时间段。
 
 ## 4. 安装与验证
 
@@ -52,15 +52,15 @@ cp config/office-config.example.yaml config/office-config.yaml
 
 默认入口为 `https://<SPARK_IP>:8443/office`，VSS 聊天位于同一入口根路径。Caddy 使用本地 CA；将 `deploy/docker/developer-profiles/office-assistant/caddy-data/caddy/pki/authorities/local/root.crt` 导入受信任办公终端，或替换 Caddyfile 使用组织签发的证书。
 
-办公面板每 2 秒刷新当前可见人数，显示每个匿名 Track ID 的出现时间、最后看到时间、离开时间和停留时长。结构化接口为 `GET /office-api/api/occupancy/current`。
+办公面板在查看当天时自动刷新活动事件与当前人数；历史日期保持静态。活动日志接口为 `GET /office-api/api/activity/events?date=YYYY-MM-DD`，也可使用 `start`、`end`、`person_id` 和 `q` 参数。原有工位结构化接口 `GET /office-api/api/workstation/live` 和 `GET /office-api/api/workstation/reports` 保持兼容。VSS Agent 的 `office_activity_query` 工具可按日期、时间、人员或关键词读取同一份日志。
 
 安装脚本会尝试通过 VSS Agent API 自动注册 `rtsp://127.0.0.1:8554/office-main`。如果 VSS 启动较慢导致注册失败，可在 VSS 的 Video Management 页面手动添加同一 URL。
 
 ## 5. 数据与隐私
 
 - 不启用人脸识别，不保存人脸模板，不推断人员身份或敏感属性。
-- DeepStream 产生人员候选事件，VLM 仅验证画面中是否确有真人。
-- Office API 根据配置的时区、时间表、区域、人数和持续时间对已有事件分类。
+- RT-CV 只负责人物检测、跟踪和椅子 ROI 门控；只有椅子当前有人时才调用 Cosmos3-Nano 进行行为分类。
+- Cosmos3 只返回受控行为主类及简短可见动作描述；不读取屏幕私密内容，也不推断身份或敏感属性。
 - VIOS 循环缓冲默认限制为 128 MB；Office API 每分钟归档新事件片段到 `data/office-assistant/clips`。
 - `data/office-assistant` 保存人工确认和事件片段；本地清理线程删除超过 7 天的片段。
 - VSS Elasticsearch ILM 在部署时设置为 7 天。VIOS 的临时录像策略仍应在上线前通过 VSS 配置和磁盘检查确认。

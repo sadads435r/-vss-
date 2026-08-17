@@ -197,6 +197,18 @@ functions:
       prompt: [your detection question]
       system_prompt: You are a helpful assistant.
 
+  # Office assistant: query the automatic per-person daily activity log
+  office_activity_query:
+    _type: office_activity_query
+    office_api_url: ${OFFICE_API_URL:-http://127.0.0.1:8090}
+    timeout: 15
+
+  # Office assistant: query current number of people working at workstations
+  office_people_count:
+    _type: office_people_count
+    office_api_url: ${OFFICE_API_URL:-http://127.0.0.1:8090}
+    timeout: 15
+
 llms:
   # --- LLM profiles (selected by LLM_MODEL_TYPE) ---
   nim_llm:
@@ -267,6 +279,8 @@ workflow:
   - get_sensor_names
   - rtvi_vlm_alert
   - rtvi_prompt_gen
+  - office_activity_query
+  - office_people_count
   subagent_names:
   - report_agent
   # yamllint disable rule:line-length
@@ -285,6 +299,8 @@ workflow:
     5. For INCIDENT reports/analysis → DO NOT use report_agent. Use WORKFLOW 5 below (get_incidents + video_understanding)
     6. For REAL-TIME VLM ALERTS (start/stop monitoring) → DIRECTLY CALL rtvi_vlm_alert with action='start' or 'stop'
     7. For QUERYING/LISTING INCIDENTS → DIRECTLY CALL rtvi_vlm_alert with action='get_incidents'
+    8. For asking how many people are in the office / working now (e.g., "当前有几个人在办公", "how many people are working", "办公室有几个人") → DIRECTLY CALL office_people_count. Optionally pass detail=true to include per-person work durations.
+    9. For asking what a person did, daily activity history, an activity around a time, or activity keyword statistics (e.g., "张三今天做了什么", "昨天十点左右发生了什么", "本周谁进行过交谈") → DIRECTLY CALL office_activity_query. Resolve relative dates from the current date and pass ISO dates/datetimes. Treat returned descriptions as conservative visual observations, not proof of private screen content or business purpose.
 
     WORKFLOW 1: List Available Videos
     User: "What videos are available?" / "Show me all uploaded videos"

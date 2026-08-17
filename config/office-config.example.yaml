@@ -27,8 +27,11 @@ workstation:
     - [0.75, 0.95]
     - [0.35, 0.95]
   sample_seconds: 20
+  # Per-person activity sampling and event-change confirmation.
+  person_sample_seconds: 10
   departure_seconds: 60
   state_confirmation_samples: 2
+  minimum_activity_confidence: 0.6
   frame_stale_seconds: 15
   focused_activities: [computer, reading, writing]
   activities: [computer, reading, writing, phone, conversation, rest, unknown]

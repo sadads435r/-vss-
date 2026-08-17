@@ -1,6 +1,194 @@
-<h2>NVIDIA AI Blueprint: Video Search and Summarization (VSS)</h2>
+# DGX Spark 每日活动日志助手
 
-> DGX Spark 智能办公助手扩展请参阅 [docs/OFFICE_ASSISTANT.md](docs/OFFICE_ASSISTANT.md)。
+这是一个基于 NVIDIA Video Search and Summarization（VSS）的自定义扩展，用 USB 实时摄像头按已登记人员记录一天中的可见活动。系统将连续观察合并成“10:15–10:40 在电脑前工作”这样的时间段，并允许通过网页或 VSS Agent 查询。
+
+> 本扩展不是 NVIDIA 官方产品。仓库保留 NVIDIA VSS 的原始代码、历史、许可证和下方的官方项目说明；自定义功能集中在 `office-assistant` 目录、配置和部署脚本中。
+
+## 工作方式
+
+```mermaid
+flowchart LR
+    A[USB 实时摄像头] --> B[MediaMTX / VST]
+    B --> C[RT-CV 人物检测与跟踪]
+    C --> D{人物脚点在椅子 ROI 内?}
+    D -- 否 --> E[忽略路过人员 / 停止调用 Cosmos3]
+    D -- 是 --> F[截取椅子 ROI 当前帧]
+    F --> G[Cosmos3-Nano 16B 保守活动描述]
+    G --> H[变化确认与 SQLite 连续事件]
+    H --> I[每日活动日志网页与 Agent 查询]
+```
+
+RT-CV 持续判断画面内是否有人。Office API 对已登记人员默认每 10 秒轮询一次可见活动，并保留原有单工位 20 秒采样；人在离座缓冲期内不会继续调用模型。
+
+## 当前功能
+
+- 单摄像头、单椅子 ROI 匿名分析。
+- 当前在座状态、连续在座时间和当前行为。
+- 每日在座时长、专注时长、专注率、首次到岗和最后离岗。
+- 电脑操作、阅读、书写、手机、交谈、休息和无法判断的行为时长。
+- 按已识别人员生成带起止时间、保守描述、置信度和观察次数的连续活动事件。
+- 按日期、人员和关键词浏览网页时间线，或让 Agent 查询和总结历史活动。
+- 离座次数、离座总时长和超过 60 秒才生效的离座规则。
+- 工作日下班后、周末和配置节假日的加班时长。
+- 行为时间轴、历史日报、ROI Web 标定和事件片段。
+- 摄像头、RT-CV、Cosmos3 健康状态和断流恢复。
+- 事件片段保留 7 天，日报数据保留 365 天。
+- 内网 HTTPS 页面，无登录密码。
+
+行为分类是视觉模型估计，仅适合个人时间复盘，不应作为员工绩效、考勤处罚或身份判断依据。摄像头、RT-CV 或模型不可用的时间标记为数据缺失，不计入有效在座和专注时长。
+
+## 环境要求
+
+- NVIDIA DGX Spark，DGX OS 7.4 或兼容版本。
+- NVIDIA 驱动、CUDA 13、NVIDIA Container Toolkit。
+- Docker Engine 28.3.3 以上且低于 29.5.0，Docker Compose 2.39.1 以上。
+- `git-lfs`、`curl`、`ngc`、`v4l2-ctl` 和 Python 3。
+- 支持 1080p MJPEG 或 raw 输出的 USB 摄像头。
+- 有效的 NGC API key；Hugging Face token 可配置在 Spark 本地 `.env`。
+- Cosmos3-Nano 权重约 32.6 GiB，首次下载建议预留至少 40 GiB。
+
+## 首次部署
+
+所有密钥、密码、模型权重、录像、数据库和实际配置都保存在 Spark 本地，不应提交到 GitHub。
+
+```bash
+git clone git@github.com:sadads435r/-vss-.git
+cd ./-vss-
+
+cp .env.example .env
+cp config/office-config.example.yaml config/office-config.yaml
+```
+
+编辑 `.env`，至少填写：
+
+```dotenv
+NGC_CLI_API_KEY=你的_NGC_KEY
+HF_TOKEN=你的_Hugging_Face_TOKEN
+CAMERA_DEVICE=/dev/video0
+
+COSMOS3_MODEL_REPO=nvidia/Cosmos3-Nano
+COSMOS3_MODEL_REVISION=411f42a8fdfb8c5b2583cb8786e0938f49796eaa
+COSMOS3_MODEL_DIR=/home/shiyiming/models/Cosmos3-Nano
+COSMOS3_API_PORT=8018
+COSMOS3_IMAGE=vss-office-cosmos3-nano:26.07
+COSMOS3_AUTO_DOWNLOAD=true
+```
+
+如果 Spark 用户名不是 `shiyiming`，必须把 `COSMOS3_MODEL_DIR` 改成自己的绝对路径。然后执行：
+
+```bash
+./scripts/preflight.sh
+./scripts/install.sh
+./scripts/smoke-test.sh
+./scripts/status.sh
+```
+
+安装脚本会下载权重、启动 VSS、USB 摄像头网关、Cosmos3 服务和 Office API，并尝试把 `office-main` 自动注册到 RT-CV。权重保存在 `COSMOS3_MODEL_DIR`，停止或重建容器不会重新下载。
+
+## 已有 Spark 安装更新
+
+先备份不受 Git 管理的本地配置：
+
+```bash
+cd "$HOME/-vss-"
+cp -p .env "$HOME/vss-office.env.backup"
+cp -p config/office-config.yaml "$HOME/vss-office-config.yaml.backup"
+
+git fetch origin
+git switch main
+git pull --ff-only origin main
+
+cp -p "$HOME/vss-office.env.backup" .env
+cp -p "$HOME/vss-office-config.yaml.backup" config/office-config.yaml
+./scripts/install.sh
+./scripts/smoke-test.sh
+```
+
+如果部署的是版本标签，将 `git switch main` 和 `git pull` 换成：
+
+```bash
+git fetch --tags origin
+git checkout office-assistant-v0.2.0
+```
+
+## 使用与配置
+
+默认网页地址：
+
+```text
+https://<DGX_SPARK_IP>:8443/office
+```
+
+第一次打开后，展开“人员与摄像头设置”，获取摄像头当前帧，只框住椅面和正常坐姿区域并保存 ROI。工作时间、节假日、按人采样间隔、活动置信度、状态确认次数、离座阈值和留存时间位于：
+
+```text
+config/office-config.yaml
+```
+
+常用检查命令：
+
+```bash
+./scripts/status.sh
+docker logs --tail 200 office-api
+docker logs --tail 200 office-cosmos3-nano
+curl http://127.0.0.1:8018/health
+curl http://127.0.0.1:8090/api/workstation/live
+```
+
+如果 RT-CV 没有自动接入摄像头：
+
+```bash
+bash ./scripts/register-workstation-stream.sh
+docker compose \
+  --env-file .env \
+  -f deploy/docker/developer-profiles/office-assistant/compose.yml \
+  restart office-api
+```
+
+停止服务但保留权重、配置和历史数据：
+
+```bash
+./scripts/uninstall.sh
+```
+
+重新启动：
+
+```bash
+./scripts/install.sh
+```
+
+## 接口
+
+| 接口 | 说明 |
+|---|---|
+| `GET /office-api/api/activity/events?date=&person_id=&q=` | 按日期、人员和关键词查询活动事件与统计 |
+| `GET /office-api/api/activity/events?start=&end=` | 按 ISO 日期或时间范围查询活动事件 |
+| `GET /office-api/api/person/activity/today` | 当前人数及今日按人活动概况 |
+| `GET /office-api/api/people` | 已登记人员列表 |
+| `GET /office-api/api/workstation/live` | 当前在座、行为、连续时长和健康状态 |
+| `GET /office-api/api/workstation/reports?start=&end=` | 日期范围日报 |
+| `GET /office-api/api/workstation/reports/{date}` | 某日统计、时间轴和离座记录 |
+| `GET /office-api/api/workstation/frame` | ROI 标定当前帧 |
+| `GET /office-api/api/workstation/roi` | 读取椅子 ROI |
+| `PUT /office-api/api/workstation/roi` | 保存归一化椅子多边形 |
+
+## 安全与隐私
+
+- Web 入口没有密码，只能开放在受信任办公内网，禁止直接暴露到公网。
+- Cosmos3、Office API、VST、RT-CV、Kafka 和 Elasticsearch 端口不应向不受信任网络开放。
+- Caddy 默认签发本地 CA 证书；客户端需要信任 Caddy 根证书，或改用组织签发的证书。
+- 人员参考截图和活动数据库仅保存在本机数据目录；人员名称由管理员在内网页面维护。
+- 模型只允许描述画面可见动作，不读取或猜测屏幕内容、文件名、项目、会议主题或业务目的。
+
+更完整的配置、发布和回滚说明见 [办公助手部署文档](docs/OFFICE_ASSISTANT.md)。
+
+---
+
+## 上游 NVIDIA VSS 项目说明
+
+以下内容保留自 NVIDIA VSS 上游项目。
+
+<h2>NVIDIA AI Blueprint: Video Search and Summarization (VSS)</h2>
 
 **Build GPU-accelerated video AI agents that search, analyze, summarize, and reason over live or recorded video using natural language.**
 

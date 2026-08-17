@@ -8,21 +8,29 @@ require_file "${OFFICE_CONFIG}"
 camera_name="$(read_env CAMERA_STREAM_NAME)"; camera_name="${camera_name:-office-main}"
 rtcv_url="${RTCV_URL:-http://127.0.0.1:9010}"
 vst_url="http://127.0.0.1:$(read_env VSS_VST_PORT)"
-sensor_id="$(sed -n -E 's/^[[:space:]]+vss_sensor_id:[[:space:]]*["'"']?([^"'"']*)["'"']?[[:space:]]*$/\1/p' "${OFFICE_CONFIG}" | head -n1)"
+sensor_id="$(awk '
+  /^[[:space:]]*vss_sensor_id:[[:space:]]*/ {
+    value=$0
+    sub(/^[^:]*:[[:space:]]*/, "", value)
+    gsub(/^["\047]|["\047][[:space:]]*$/, "", value)
+    print value
+    exit
+  }
+' "${OFFICE_CONFIG}")"
 
 if [[ -z "${sensor_id}" ]]; then
   sensor_id="$(curl --fail --silent --show-error --max-time 10 "${vst_url}/vst/api/v1/sensor/list" | \
     python3 -c 'import json,sys; name=sys.argv[1]; data=json.load(sys.stdin); print(next((str(x.get("sensorId","")) for x in data if isinstance(x,dict) and (x.get("name")==name or x.get("sensorName")==name)), ""))' "${camera_name}")"
 fi
 
-# Persist the resolved ID so snapshots, clips, and Elasticsearch filtering all use
-# the same camera after an Office API restart.
-sed -i -E "s|^([[:space:]]*vss_sensor_id:).*|\1 \"${sensor_id}\"|" "${OFFICE_CONFIG}"
-
 if [[ -z "${sensor_id}" ]]; then
   echo "[ERROR] Could not resolve the VST sensor ID for ${camera_name}. Set camera.vss_sensor_id in config/office-config.yaml." >&2
   exit 1
 fi
+
+# Persist the resolved ID so snapshots, clips, and Elasticsearch filtering all use
+# the same camera after an Office API restart.
+sed -i -E "s|^([[:space:]]*vss_sensor_id:).*|\1 \"${sensor_id}\"|" "${OFFICE_CONFIG}"
 
 host_ip="$(ip route get 1.1.1.1 | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 camera_url="rtsp://${host_ip}:30554/live/${sensor_id}"

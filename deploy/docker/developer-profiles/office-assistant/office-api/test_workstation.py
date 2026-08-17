@@ -1,8 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -72,6 +74,91 @@ class WorkstationTest(unittest.TestCase):
         self.assertEqual(self.engine.live(observed + 20)["activity"], "unknown")
         self.engine._record_activity(observed + 40, "computer", 0.9, "typing")
         self.assertEqual(self.engine.live(observed + 40)["activity"], "computer")
+
+    def test_person_activity_event_merges_and_splits_after_confirmation(self) -> None:
+        observed = datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            person_id = connection.execute(
+                "INSERT INTO people(name, first_seen_at, last_seen_at) VALUES ('张三', ?, ?)",
+                (observed, observed),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO person_track_map(track_id, person_id, matched_at) VALUES ('person-1', ?, ?)",
+                (person_id, observed),
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "computer", "在电脑前工作", 0.9, False, observed,
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "computer", "在电脑前工作", 0.9, False, observed + 10,
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "computer", "在电脑前工作", 0.8, True, observed + 20,
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "reading", "阅读纸质材料", 0.3, False, observed + 30,
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "reading", "阅读纸质材料", 0.9, False, observed + 40,
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "reading", "阅读纸质材料", 0.9, False, observed + 50,
+            )
+
+        result = self.engine.activity_events(observed - 1, observed + 3600, now=observed + 60)
+        self.assertEqual([event["activity"] for event in result["events"]], ["computer", "reading"])
+        self.assertEqual(result["events"][0]["description"], "在电脑前工作")
+        self.assertEqual(result["events"][0]["observation_count"], 3)
+        self.assertEqual(result["events"][0]["ended_at"], observed + 40)
+        self.assertTrue(result["events"][1]["ongoing"])
+
+    def test_schema_upgrade_is_idempotent_and_keeps_legacy_rows(self) -> None:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO person_activity_intervals("
+                "camera_id, track_id, activity, confidence, started_at, ended_at) "
+                "VALUES ('office-main', 'legacy', 'writing', 0.8, 10, 20)"
+            )
+        initialize_schema(self.database)
+        initialize_schema(self.database)
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(person_activity_intervals)")}
+            count = connection.execute("SELECT COUNT(*) FROM person_activity_intervals").fetchone()[0]
+        self.assertTrue({"person_id", "description", "last_observed_at", "observation_count"} <= columns)
+        self.assertEqual(count, 1)
+
+    def test_activity_query_filters_person_and_keyword(self) -> None:
+        observed = datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp()
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            person_id = connection.execute(
+                "INSERT INTO people(name, first_seen_at, last_seen_at) VALUES ('李四', ?, ?)",
+                (observed, observed),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO person_activity_intervals("
+                "camera_id, track_id, person_id, activity, description, confidence, "
+                "started_at, ended_at, last_observed_at, observation_count) "
+                "VALUES ('office-main', 'track-2', ?, 'writing', '在纸上书写', 0.91, ?, ?, ?, 4)",
+                (person_id, observed, observed + 120, observed + 120),
+            )
+            connection.execute(
+                "INSERT INTO person_activity_intervals("
+                "camera_id, track_id, person_id, activity, description, confidence, "
+                "started_at, ended_at, last_observed_at, observation_count) "
+                "VALUES ('office-main', 'track-3', ?, 'writing', '在纸上书写', 0.89, ?, ?, ?, 2)",
+                (person_id, observed + 130, observed + 180, observed + 180),
+            )
+        found = self.engine.activity_events(
+            observed - 1, observed + 300, person_id=person_id, query="书写", now=observed + 300,
+        )
+        missing = self.engine.activity_events(
+            observed - 1, observed + 300, person_id=person_id + 1, now=observed + 300,
+        )
+        self.assertEqual(found["event_count"], 1)
+        self.assertEqual(found["events"][0]["duration_seconds"], 180)
+        self.assertEqual(found["events"][0]["observation_count"], 6)
+        self.assertEqual(found["people"][0]["categories"], {"writing": 180})
+        self.assertEqual(missing["events"], [])
 
     def test_cosmos_is_only_called_when_chair_is_currently_occupied(self) -> None:
         observed = 1786323600.0

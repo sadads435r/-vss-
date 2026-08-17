@@ -3,13 +3,16 @@
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import app
 from app import ConfigurationError
 from app import load_config
 from app import office_event_type
+from app import parse_activity_window
 
 VALID_CONFIG = """
 timezone: Asia/Hong_Kong
@@ -22,7 +25,7 @@ workstation:
   sample_seconds: 20
   departure_seconds: 60
   state_confirmation_samples: 2
-  activities: [computer, reading, writing, phone, conversation, rest, unknown]
+  activities: [computer, reading, writing, phone, conversation, eating, rest, unknown]
   focused_activities: [computer, reading, writing]
   report_retention_days: 365
   cosmos3_url: http://127.0.0.1:8018
@@ -46,6 +49,24 @@ class ConfigTest(unittest.TestCase):
 
     def test_valid_config(self) -> None:
         self.assertEqual(load_config(self.write_config(VALID_CONFIG))["retention"]["event_days"], 7)
+
+    def test_activity_window_accepts_date_and_datetime_range(self) -> None:
+        timezone = ZoneInfo("Asia/Hong_Kong")
+        start, end = parse_activity_window({"date": ["2026-08-10"]}, timezone)
+        self.assertEqual(datetime.fromtimestamp(start, timezone).isoformat(), "2026-08-10T00:00:00+08:00")
+        self.assertEqual(end - start, 86400)
+        range_start, range_end = parse_activity_window(
+            {"start": ["2026-08-10T10:00:00+08:00"], "end": ["2026-08-10T11:30:00+08:00"]},
+            timezone,
+        )
+        self.assertEqual(range_end - range_start, 5400)
+
+    def test_activity_window_rejects_invalid_range(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_activity_window(
+                {"start": ["2026-08-11"], "end": ["2026-08-10"]},
+                ZoneInfo("Asia/Hong_Kong"),
+            )
 
     def test_rejects_non_rtsp_camera(self) -> None:
         with self.assertRaises(ConfigurationError):
