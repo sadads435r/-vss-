@@ -39,6 +39,31 @@ workstation:
   cosmos3_model: auto
   report_retention_days: 365
   event_clip_retention_days: 7
+  # Continuous pose/motion pipeline. Set enabled: false to use the legacy
+  # per-person single-image classifier above.
+  motion_pipeline:
+    enabled: true
+    window_seconds: 8
+    step_seconds: 2
+    semantic_interval_seconds: 10
+    minimum_semantic_interval_seconds: 5
+    pose_minimum_confidence: 0.35
+    frame_buffer_seconds: 120
+    frame_buffer_fps: 2
+    person_storyboard_frames: 6
+    scene_storyboard_frames: 4
+    storyboard_retention_days: 7
+    queue_limit: 100
+    mediapipe_hand_model: /models/mediapipe/hand_landmarker.task
+  identity:
+    confirmation_samples: 2
+    cosmos_match_confidence: 0.85
+    candidate_limit: 3
+    gallery_limit: 5
+    minimum_image_height: 256
+    minimum_detection_confidence: 0.7
+    minimum_visible_keypoints_ratio: 0.8
+    gallery_diversity_similarity: 0.95
 
 schedule:
   weekdays: [monday, tuesday, wednesday, thursday, friday]

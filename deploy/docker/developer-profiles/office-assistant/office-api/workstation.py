@@ -24,6 +24,20 @@ from zoneinfo import ZoneInfo
 from PIL import Image
 import yaml
 
+from motion import (
+    MediaPipeHandAnalyzer,
+    RtspFrameBuffer,
+    build_storyboard,
+    cosine_similarity,
+    crop_person_frames,
+    extract_embedding,
+    facts_json,
+    parse_pose,
+    parse_timestamp,
+    select_storyboard_frames,
+    summarize_motion,
+)
+
 ACTIVITIES = ("computer", "reading", "writing", "phone", "conversation", "eating", "rest", "unknown")
 ACTIVITY_LABELS = {
     "computer": "电脑操作",
@@ -73,6 +87,32 @@ def default_config() -> dict[str, Any]:
         "person_sample_seconds": 10,
         # 在场/在椅区间融合为连续"在工位"段的最大间隙（人坐下后短暂漏检不算离席）
         "person_presence_merge_seconds": 300,
+        # Continuous motion pipeline. The legacy single-image classifier remains the rollback path.
+        "motion_pipeline": {
+            "enabled": True,
+            "window_seconds": 8,
+            "step_seconds": 2,
+            "semantic_interval_seconds": 10,
+            "minimum_semantic_interval_seconds": 5,
+            "pose_minimum_confidence": 0.35,
+            "frame_buffer_seconds": 120,
+            "frame_buffer_fps": 2,
+            "person_storyboard_frames": 6,
+            "scene_storyboard_frames": 4,
+            "mediapipe_hand_model": "/models/mediapipe/hand_landmarker.task",
+            "storyboard_retention_days": 7,
+            "queue_limit": 100,
+        },
+        "identity": {
+            "confirmation_samples": 2,
+            "cosmos_match_confidence": 0.85,
+            "candidate_limit": 3,
+            "gallery_limit": 5,
+            "minimum_image_height": 256,
+            "minimum_detection_confidence": 0.7,
+            "minimum_visible_keypoints_ratio": 0.8,
+            "gallery_diversity_similarity": 0.95,
+        },
     }
 
 
@@ -155,6 +195,18 @@ def validate_workstation_config(config: dict[str, Any]) -> None:
     retention = int(workstation.get("report_retention_days", 0))
     if retention < 1 or retention > 3650:
         raise ValueError("workstation.report_retention_days must be between 1 and 3650")
+    motion = workstation.get("motion_pipeline", {})
+    if not isinstance(motion, dict):
+        raise ValueError("workstation.motion_pipeline must be a mapping")
+    if float(motion.get("window_seconds", 8)) < 4:
+        raise ValueError("workstation.motion_pipeline.window_seconds must be at least 4")
+    if float(motion.get("step_seconds", 2)) < 1:
+        raise ValueError("workstation.motion_pipeline.step_seconds must be at least 1")
+    if float(motion.get("minimum_semantic_interval_seconds", 5)) < 1:
+        raise ValueError("workstation.motion_pipeline.minimum_semantic_interval_seconds must be at least 1")
+    identity = workstation.get("identity", {})
+    if not isinstance(identity, dict) or int(identity.get("confirmation_samples", 2)) < 2:
+        raise ValueError("workstation.identity.confirmation_samples must be at least 2")
 
 
 def initialize_schema(database_file: Path) -> None:
@@ -256,6 +308,64 @@ def initialize_schema(database_file: Path) -> None:
             "confidence REAL NOT NULL DEFAULT 0, reason TEXT NOT NULL DEFAULT '', "
             "image_path TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)"
         )
+        _ensure_columns(connection, "person_verifications", {
+            "decision": "TEXT NOT NULL DEFAULT ''",
+            "candidate_person_id": "INTEGER",
+            "reid_similarity": "REAL NOT NULL DEFAULT 0",
+            "candidate_json": "TEXT NOT NULL DEFAULT '[]'",
+            "quality_score": "REAL NOT NULL DEFAULT 0",
+        })
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_person_verification_track_time "
+            "ON person_verifications(track_id, created_at)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS person_reference_images ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, person_id INTEGER NOT NULL, path TEXT NOT NULL UNIQUE, "
+            "captured_at REAL NOT NULL, quality_score REAL NOT NULL DEFAULT 0, "
+            "embedding_json TEXT NOT NULL DEFAULT '[]', is_cover INTEGER NOT NULL DEFAULT 0, "
+            "active INTEGER NOT NULL DEFAULT 1)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reference_person_active "
+            "ON person_reference_images(person_id, active, quality_score DESC)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS person_motion_windows ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, camera_id TEXT NOT NULL, track_id TEXT NOT NULL, "
+            "person_id INTEGER, started_at REAL NOT NULL, ended_at REAL NOT NULL, "
+            "facts_json TEXT NOT NULL, motion_summary TEXT NOT NULL DEFAULT '', "
+            "person_storyboard TEXT NOT NULL DEFAULT '', scene_storyboard TEXT NOT NULL DEFAULT '', "
+            "hand_json TEXT NOT NULL DEFAULT '{}', quality REAL NOT NULL DEFAULT 0, "
+            "status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, "
+            "next_retry_at REAL NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, "
+            "UNIQUE(camera_id, track_id, started_at, ended_at))"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_motion_status_retry "
+            "ON person_motion_windows(status, next_retry_at, ended_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_motion_person_time "
+            "ON person_motion_windows(person_id, started_at)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS person_activity_observations ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, interval_id INTEGER, motion_window_id INTEGER NOT NULL UNIQUE, "
+            "category TEXT NOT NULL, description TEXT NOT NULL, observed_actions_json TEXT NOT NULL DEFAULT '[]', "
+            "continues_current INTEGER NOT NULL DEFAULT 0, confidence REAL NOT NULL DEFAULT 0, "
+            "uncertainty TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS motion_frame_tokens ("
+            "token TEXT PRIMARY KEY, observed_at REAL NOT NULL)"
+        )
+        # Upgrade legacy one-image profiles into the reference gallery exactly once.
+        connection.execute(
+            "INSERT OR IGNORE INTO person_reference_images("
+            "person_id, path, captured_at, quality_score, is_cover) "
+            "SELECT id, reference_image, last_seen_at, 0.5, 1 FROM people WHERE reference_image != ''"
+        )
 
 
 def overlap(start: float, end: float, window_start: float, window_end: float) -> float:
@@ -287,6 +397,8 @@ class WorkstationEngine:
         # 人员参考图存储目录：数据库同级 people/
         self.people_dir = database_file.parent / "people"
         self.people_dir.mkdir(parents=True, exist_ok=True)
+        self.storyboard_dir = database_file.parent / "storyboards"
+        self.storyboard_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.last_frame: dict[str, Any] | None = None
         self.last_frame_received_at: float | None = None
@@ -303,6 +415,12 @@ class WorkstationEngine:
         self._person_last_verify_at: dict[str, float] = {}
         # 待判定的新 track 队列（track_id -> bbox），由 worker 主循环异步消费（不阻塞 process_frame）
         self._person_pending: dict[str, dict[str, Any]] = {}
+        # Synchronized RT-CV pose samples are kept in memory only; aggregate windows are persisted.
+        self._motion_samples: dict[str, list[dict[str, Any]]] = {}
+        self._motion_last_window_at: dict[str, float] = {}
+        self._motion_last_semantic_at: dict[str, float] = {}
+        self.frame_buffer: RtspFrameBuffer | None = None
+        self.hand_analyzer: MediaPipeHandAnalyzer | None = None
         self.model_id: str | None = None
         self.last_health_check = 0.0
         self.last_health_result = False
@@ -419,6 +537,11 @@ class WorkstationEngine:
             if not track_id:
                 continue
             seen.add(track_id)
+            mapped = connection.execute(
+                "SELECT person_id FROM person_track_map WHERE track_id = ?", (track_id,)
+            ).fetchone()
+            if mapped:
+                connection.execute("UPDATE people SET last_seen_at = ? WHERE id = ?", (observed, int(mapped[0])))
             if point_in_polygon(foot, polygon):
                 self._observe_person_seated(connection, camera_id, track_id, observed)
             else:
@@ -434,18 +557,19 @@ class WorkstationEngine:
                 else:
                     self._person_seen_seconds[track_id] = observed - self._person_first_seen[track_id]
                 if self._person_seen_seconds[track_id] >= verify_seconds:
-                    pending.append((track_id, bbox))
+                    pending.append((track_id, dict(item)))
         for track_id in list(self.person_seated):
             if track_id not in seen:
                 self._close_person_seated(connection, track_id, observed)
+        self._close_departed_person_activities(connection, seen, observed)
         # 达标的新 track 进入内存待判队列，由 worker 主循环异步消费（VLM 判定不能占用 DB 事务）
-        for track_id, bbox in pending:
-            self._person_pending.setdefault(track_id, bbox)
+        for track_id, item in pending:
+            self._person_pending.setdefault(track_id, item)
 
     def _drain_person_pending(self, now: float | None = None) -> None:
         """worker 主循环调用：每次处理一个待判新 track（VLM 判定耗时，异步执行）。"""
         current = time.time() if now is None else now
-        for track_id, bbox in list(self._person_pending.items()):
+        for track_id, item in list(self._person_pending.items()):
             cooldown = max(0.0, float(self.workstation.get("person_reject_cooldown_seconds", 600)))
             # 已入库/被拒冷却中的 track 跳过
             with closing(self._connect()) as connection:
@@ -461,13 +585,14 @@ class WorkstationEngine:
                 continue
             self._person_last_verify_at[track_id] = current
             self._person_pending.pop(track_id, None)
-            self._verify_new_track(track_id, bbox, current)
+            self._verify_new_track(track_id, item, current)
             return  # 每轮只处理一个，避免 VLM 长时间阻塞 worker
 
-    def _verify_new_track(self, track_id: str, bbox: dict[str, Any], observed: float) -> None:
-        """新 track 判定流程：截图 → VLM 单图判定是否真人 → 多图与人员库比对 → 入库/归并。"""
+    def _verify_new_track(self, track_id: str, item: dict[str, Any], observed: float) -> None:
+        """Verify a new track twice before matching or enrolling it."""
         reject_cooldown = max(0.0, float(self.workstation.get("person_reject_cooldown_seconds", 600)))
-        camera_id = str(self.config["camera"].get("id", "office-main"))
+        bbox = item.get("bbox") or {}
+        embedding = extract_embedding(item)
         try:
             image = self.crop_person_bbox(bbox)
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -481,21 +606,68 @@ class WorkstationEngine:
             print(f"[office-api] person verify VLM failed track={track_id}: {error}", flush=True)
             return
         is_person = bool(verdict.get("is_person", False))
+        verdict_confidence = max(0.0, min(1.0, float(verdict.get("confidence", 0))))
         reason = str(verdict.get("reason", ""))[:200]
+        quality = self._person_image_quality(image, item)
         with self.lock, closing(self._connect()) as connection, connection:
-            connection.execute(
-                "INSERT INTO person_verifications(track_id, is_person, confidence, reason, image_path, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (track_id, int(is_person), float(verdict.get("confidence", 0)), reason, "", observed),
-            )
             if not is_person:
+                connection.execute(
+                    "INSERT INTO person_verifications("
+                    "track_id, is_person, confidence, reason, decision, quality_score, created_at) "
+                    "VALUES (?, 0, ?, ?, 'rejected', ?, ?)",
+                    (track_id, verdict_confidence, reason, quality, observed),
+                )
                 # 非真人：冷却期内不再重复判定（布偶/海报类稳定误检）
                 self._person_reject_until[track_id] = observed + reject_cooldown
                 return
-            # Step 2: 与人员库逐一多图比对
-            matched_person_id = self._match_person_identity(image, connection)
-            image_path = self._store_person_image(track_id, image)
-            if matched_person_id is not None:
+            if quality <= 0:
+                connection.execute(
+                    "INSERT INTO person_verifications("
+                    "track_id, is_person, confidence, reason, decision, quality_score, created_at) "
+                    "VALUES (?, 1, ?, '截图未达到建档质量阈值', 'low_quality', 0, ?)",
+                    (track_id, verdict_confidence, observed),
+                )
+                return
+            (
+                matched_person_id, match_confidence, nonmatch_confidence,
+                reid_similarity, candidates, match_reason,
+            ) = self._match_person_identity(
+                image, embedding, connection,
+            )
+            identity = self.workstation.get("identity", {})
+            required = max(2, int(identity.get("confirmation_samples", 2)))
+            threshold = float(identity.get("cosmos_match_confidence", 0.85))
+            if matched_person_id is not None and match_confidence >= threshold:
+                decision = "match_candidate"
+                decision_confidence = match_confidence
+            elif matched_person_id is None and (not candidates or nonmatch_confidence >= threshold):
+                decision = "new_candidate"
+                decision_confidence = nonmatch_confidence if candidates else verdict_confidence
+            else:
+                decision = "ambiguous"
+                decision_confidence = max(match_confidence, nonmatch_confidence)
+            connection.execute(
+                "INSERT INTO person_verifications("
+                "track_id, is_person, matched_person_id, confidence, reason, image_path, created_at, decision, "
+                "candidate_person_id, reid_similarity, candidate_json, quality_score) "
+                "VALUES (?, 1, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)",
+                (
+                    track_id, matched_person_id, decision_confidence,
+                    match_reason or reason, observed, decision, matched_person_id, reid_similarity,
+                    json.dumps(candidates, ensure_ascii=False), quality,
+                ),
+            )
+            if decision == "ambiguous":
+                return
+            if decision == "match_candidate":
+                confirmations = connection.execute(
+                    "SELECT COUNT(DISTINCT CAST(created_at AS INTEGER)) FROM person_verifications WHERE track_id = ? "
+                    "AND decision = 'match_candidate' AND candidate_person_id = ? AND confidence >= ?",
+                    (track_id, matched_person_id, threshold),
+                ).fetchone()[0]
+                if int(confirmations) < required:
+                    return
+                image_path = self._store_person_image(track_id, image)
                 connection.execute(
                     "INSERT INTO person_track_map(track_id, person_id, matched_at) VALUES (?, ?, ?) "
                     "ON CONFLICT(track_id) DO UPDATE SET person_id=excluded.person_id, matched_at=excluded.matched_at",
@@ -505,13 +677,22 @@ class WorkstationEngine:
                     "UPDATE people SET last_seen_at = ? WHERE id = ?", (observed, matched_person_id)
                 )
                 connection.execute(
-                    "UPDATE person_verifications SET matched_person_id = ?, image_path = ? WHERE track_id = ? "
-                    "AND created_at = ?",
-                    (matched_person_id, image_path, track_id, observed),
+                    "UPDATE person_verifications SET image_path = ?, decision = 'matched' WHERE track_id = ? "
+                    "AND decision = 'match_candidate'",
+                    (image_path, track_id),
                 )
+                self._add_reference_image(connection, int(matched_person_id), image_path, observed, quality, embedding)
+                self._backfill_person(connection, track_id, int(matched_person_id))
                 print(f"[office-api] track {track_id} -> 人员 #{matched_person_id} (匹配), image={image_path}", flush=True)
                 return
-            # 未匹配：注册为新人
+            confirmations = connection.execute(
+                "SELECT COUNT(DISTINCT CAST(created_at AS INTEGER)) FROM person_verifications WHERE track_id = ? "
+                "AND decision = 'new_candidate' AND is_person = 1 AND confidence >= ?",
+                (track_id, threshold),
+            ).fetchone()[0]
+            if int(confirmations) < required:
+                return
+            image_path = self._store_person_image(track_id, image)
             cursor = connection.execute(
                 "INSERT INTO people(name, first_seen_at, last_seen_at, reference_image) "
                 "VALUES (?, ?, ?, ?)",
@@ -523,10 +704,12 @@ class WorkstationEngine:
                 (track_id, person_id, observed),
             )
             connection.execute(
-                "UPDATE person_verifications SET matched_person_id = ?, image_path = ? WHERE track_id = ? "
-                "AND created_at = ?",
-                (person_id, image_path, track_id, observed),
+                "UPDATE person_verifications SET matched_person_id = ?, image_path = ?, decision = 'enrolled' "
+                "WHERE track_id = ? AND decision = 'new_candidate'",
+                (person_id, image_path, track_id),
             )
+            self._add_reference_image(connection, person_id, image_path, observed, quality, embedding, is_cover=True)
+            self._backfill_person(connection, track_id, person_id)
             print(f"[office-api] 新人注册: track {track_id} -> 人员 #{person_id}, image={image_path}", flush=True)
 
     def _next_person_number(self, connection: sqlite3.Connection) -> int:
@@ -545,33 +728,169 @@ class WorkstationEngine:
         except ValueError:
             return str(path)
 
-    def _match_person_identity(self, image: bytes, connection: sqlite3.Connection) -> int | None:
-        """与人员库中最近活跃的人员逐一多图比对，返回匹配的 person_id 或 None。"""
-        max_compare = max(1, int(self.workstation.get("person_max_compare", 8)))
+    def _match_person_identity(
+        self,
+        image: bytes,
+        embedding: list[float],
+        connection: sqlite3.Connection,
+    ) -> tuple[int | None, float, float, float, list[dict[str, Any]], str]:
+        """Use RT-CV ReID for top-k recall and Cosmos only for final identity confirmation."""
+        identity = self.workstation.get("identity", {})
+        limit = max(1, int(identity.get("candidate_limit", 3)))
         rows = connection.execute(
-            "SELECT id, reference_image FROM people WHERE active = 1 AND reference_image != '' "
-            "ORDER BY last_seen_at DESC LIMIT ?",
-            (max_compare,),
+            "SELECT p.id, p.name, p.last_seen_at, r.path, r.embedding_json, r.quality_score "
+            "FROM people p JOIN person_reference_images r ON r.person_id = p.id "
+            "WHERE p.active = 1 AND r.active = 1 ORDER BY p.last_seen_at DESC, r.quality_score DESC"
         ).fetchall()
-        if not rows:
-            return None
+        profiles: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            person_id = int(row["id"])
+            profile = profiles.setdefault(person_id, {
+                "person_id": person_id,
+                "name": str(row["name"]),
+                "last_seen_at": float(row["last_seen_at"]),
+                "similarity": 0.0,
+                "references": [],
+            })
+            try:
+                reference_embedding = json.loads(str(row["embedding_json"] or "[]"))
+            except json.JSONDecodeError:
+                reference_embedding = []
+            similarity = cosine_similarity(embedding, reference_embedding)
+            profile["similarity"] = max(float(profile["similarity"]), similarity)
+            profile["references"].append((str(row["path"]), float(row["quality_score"])))
+        candidates = sorted(
+            profiles.values(),
+            key=lambda value: (float(value["similarity"]), float(value["last_seen_at"])),
+            reverse=True,
+        )[:limit]
+        public_candidates = [
+            {"person_id": item["person_id"], "name": item["name"], "reid_similarity": round(item["similarity"], 4)}
+            for item in candidates
+        ]
         best_id: int | None = None
         best_score = 0.0
-        for row in rows:
-            reference = self.database_file.parent / row["reference_image"]
-            if not reference.is_file():
-                continue
+        best_similarity = 0.0
+        best_reason = ""
+        mismatch_scores: list[float] = []
+        for candidate in candidates:
+            references = sorted(candidate["references"], key=lambda value: value[1], reverse=True)[:3]
+            candidate_score = 0.0
+            candidate_reason = ""
+            candidate_mismatch = 0.0
+            compared = False
+            for path_value, _quality in references:
+                reference = self.database_file.parent / path_value
+                if not reference.is_file():
+                    continue
+                try:
+                    result = self._call_vlm_identity(reference.read_bytes(), image)
+                except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as error:
+                    self.last_vlm_error = str(error)
+                    continue
+                compared = True
+                if bool(result.get("same_person", False)):
+                    score = max(0.0, min(1.0, float(result.get("confidence", 0))))
+                    if score > candidate_score:
+                        candidate_score = score
+                        candidate_reason = str(result.get("reason", ""))[:200]
+                else:
+                    candidate_mismatch = max(
+                        candidate_mismatch,
+                        max(0.0, min(1.0, float(result.get("confidence", 0)))),
+                    )
+            if compared and candidate_score == 0:
+                mismatch_scores.append(candidate_mismatch)
+            if candidate_score > best_score:
+                best_id = int(candidate["person_id"])
+                best_score = candidate_score
+                best_similarity = float(candidate["similarity"])
+                best_reason = candidate_reason
+        nonmatch_confidence = (
+            min(mismatch_scores)
+            if best_id is None and len(mismatch_scores) == len(candidates) and candidates
+            else 0.0
+        )
+        return best_id, best_score, nonmatch_confidence, best_similarity, public_candidates, best_reason
+
+    def _person_image_quality(self, image: bytes, item: dict[str, Any]) -> float:
+        """Score enrollment evidence without using identity or sensitive attributes."""
+        identity = self.workstation.get("identity", {})
+        bbox = item.get("bbox") or {}
+        height = max(0.0, float(bbox.get("bottomY", 0)) - float(bbox.get("topY", 0)))
+        confidence = max(float(item.get("confidence", 0)), float(bbox.get("confidence", 0)))
+        pose = parse_pose(item)
+        visible = sum(point.confidence >= 0.35 for point in pose.values()) / 34 if pose else 1.0
+        with Image.open(io.BytesIO(image)) as source:
+            grayscale = source.convert("L").resize((64, 64))
+            pixels = list(grayscale.getdata())
+        mean = sum(pixels) / max(1, len(pixels))
+        contrast = min(1.0, (sum((value - mean) ** 2 for value in pixels) / max(1, len(pixels))) ** 0.5 / 64)
+        passed = (
+            height >= float(identity.get("minimum_image_height", 256))
+            and confidence >= float(identity.get("minimum_detection_confidence", 0.7))
+            and visible >= float(identity.get("minimum_visible_keypoints_ratio", 0.8))
+        )
+        return round((0.4 * min(1.0, height / 512) + 0.3 * confidence + 0.2 * visible + 0.1 * contrast) if passed else 0.0, 4)
+
+    def _add_reference_image(
+        self,
+        connection: sqlite3.Connection,
+        person_id: int,
+        path: str,
+        captured_at: float,
+        quality: float,
+        embedding: list[float],
+        is_cover: bool = False,
+    ) -> None:
+        identity = self.workstation.get("identity", {})
+        if quality <= 0:
+            return
+        existing = connection.execute(
+            "SELECT id, embedding_json FROM person_reference_images WHERE person_id = ? AND active = 1",
+            (person_id,),
+        ).fetchall()
+        diversity = float(identity.get("gallery_diversity_similarity", 0.95))
+        for row in existing:
             try:
-                result = self._call_vlm_identity(reference.read_bytes(), image)
-            except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as error:
-                self.last_vlm_error = str(error)
-                continue
-            same = bool(result.get("same_person", False))
-            score = float(result.get("confidence", 0))
-            if same and score > best_score:
-                best_id = int(row["id"])
-                best_score = score
-        return best_id
+                stored = json.loads(str(row["embedding_json"] or "[]"))
+            except json.JSONDecodeError:
+                stored = []
+            if stored and embedding and cosine_similarity(stored, embedding) >= diversity:
+                return
+        if is_cover:
+            connection.execute("UPDATE person_reference_images SET is_cover = 0 WHERE person_id = ?", (person_id,))
+        connection.execute(
+            "INSERT OR IGNORE INTO person_reference_images("
+            "person_id, path, captured_at, quality_score, embedding_json, is_cover) VALUES (?, ?, ?, ?, ?, ?)",
+            (person_id, path, captured_at, quality, json.dumps(embedding), int(is_cover)),
+        )
+        limit = max(1, int(identity.get("gallery_limit", 5)))
+        rows = connection.execute(
+            "SELECT id FROM person_reference_images WHERE person_id = ? AND active = 1 "
+            "ORDER BY is_cover DESC, quality_score DESC, captured_at DESC",
+            (person_id,),
+        ).fetchall()
+        for row in rows[limit:]:
+            connection.execute("UPDATE person_reference_images SET active = 0, is_cover = 0 WHERE id = ?", (int(row[0]),))
+        cover = connection.execute(
+            "SELECT path FROM person_reference_images WHERE person_id = ? AND active = 1 "
+            "ORDER BY is_cover DESC, quality_score DESC LIMIT 1",
+            (person_id,),
+        ).fetchone()
+        if cover:
+            connection.execute("UPDATE people SET reference_image = ? WHERE id = ?", (str(cover[0]), person_id))
+
+    @staticmethod
+    def _backfill_person(connection: sqlite3.Connection, track_id: str, person_id: int) -> None:
+        connection.execute(
+            "UPDATE person_activity_intervals SET person_id = ? WHERE track_id = ? AND person_id IS NULL",
+            (person_id, track_id),
+        )
+        connection.execute(
+            "UPDATE person_motion_windows SET person_id = ? WHERE track_id = ? AND person_id IS NULL",
+            (person_id, track_id),
+        )
 
     def _call_vlm_verdict(self, image: bytes) -> dict[str, Any]:
         """单图判定：检测框里是否是一个真实的人（排除玩具/海报/显示器画面/阴影等）。"""
@@ -665,12 +984,26 @@ class WorkstationEngine:
         connection.execute(
             "UPDATE person_seated_intervals SET ended_at = ? WHERE id = ?", (row[0], interval_id)
         )
-        connection.execute(
-            "UPDATE person_activity_intervals SET ended_at = COALESCE(last_observed_at, ?) "
-            "WHERE track_id = ? AND ended_at IS NULL",
-            (row[0], track_id),
-        )
         self.person_seated.pop(track_id, None)
+
+    def _close_departed_person_activities(
+        self, connection: sqlite3.Connection, seen: set[str], observed: float,
+    ) -> None:
+        """Close events only after a track is absent, not merely outside the chair ROI."""
+        departure = float(self.workstation.get("departure_seconds", 60))
+        rows = connection.execute(
+            "SELECT DISTINCT track_id, MAX(COALESCE(last_observed_at, started_at)) AS last_seen "
+            "FROM person_activity_intervals WHERE ended_at IS NULL GROUP BY track_id"
+        ).fetchall()
+        for row in rows:
+            track_id = str(row["track_id"])
+            last_seen = float(row["last_seen"])
+            if track_id not in seen and observed - last_seen >= departure:
+                connection.execute(
+                    "UPDATE person_activity_intervals SET ended_at = COALESCE(last_observed_at, ?) "
+                    "WHERE track_id = ? AND ended_at IS NULL",
+                    (last_seen, track_id),
+                )
 
     def _current_person_event(self, connection: sqlite3.Connection, track_id: str) -> sqlite3.Row | None:
         mapping = connection.execute(
@@ -691,7 +1024,7 @@ class WorkstationEngine:
     def _record_person_activity(
         self, connection: sqlite3.Connection, camera_id: str, track_id: str,
         activity: str, description: str, confidence: float, continues_current: bool, observed: float,
-    ) -> None:
+    ) -> int | None:
         """Merge repeated observations and split only after a confirmed activity change."""
         connection.row_factory = sqlite3.Row
         confirmations = int(self.workstation.get("state_confirmation_samples", 2))
@@ -801,6 +1134,298 @@ class WorkstationEngine:
                 pending_description, pending_started_at,
             ),
         )
+        current_event = self._current_person_event(connection, track_id)
+        return int(current_event["id"]) if current_event else None
+
+    def enable_motion_runtime(self) -> None:
+        """Start evidence buffering only in the dedicated motion worker process."""
+        if self.frame_buffer is None:
+            motion = self.workstation.get("motion_pipeline", {})
+            self.frame_buffer = RtspFrameBuffer(
+                str(self.config["camera"].get("rtsp_url", "")),
+                retention_seconds=float(motion.get(
+                    "frame_buffer_seconds",
+                    self.config.get("retention", {}).get("transient_buffer_seconds", 120),
+                )),
+                fps=float(motion.get("frame_buffer_fps", 2)),
+            )
+            self.frame_buffer.start()
+        if self.hand_analyzer is None:
+            model_path = str(self.workstation.get("motion_pipeline", {}).get("mediapipe_hand_model", ""))
+            self.hand_analyzer = MediaPipeHandAnalyzer(model_path)
+
+    def process_motion_frame(self, frame: dict[str, Any], now: float | None = None) -> int:
+        """Ingest synchronized RT-CV bbox/ReID/pose metadata and persist due motion windows."""
+        if not self.workstation.get("motion_pipeline", {}).get("enabled", True):
+            return 0
+        current = time.time() if now is None else now
+        try:
+            observed = parse_timestamp(frame.get("timestamp", current))
+        except (TypeError, ValueError):
+            observed = current
+        token = f"{frame.get('sensorId', '')}:{frame.get('id', '')}:{frame.get('timestamp', '')}"
+        with self.lock, closing(self._connect()) as connection, connection:
+            try:
+                connection.execute("INSERT INTO motion_frame_tokens(token, observed_at) VALUES (?, ?)", (token, observed))
+            except sqlite3.IntegrityError:
+                return 0
+            self._set_state(connection, "motion_worker_last_seen", current)
+            self._set_state(connection, "motion_worker_last_frame_at", observed)
+        motion_config = self.workstation.get("motion_pipeline", {})
+        window_seconds = max(4.0, float(motion_config.get("window_seconds", 8)))
+        step_seconds = max(1.0, float(motion_config.get("step_seconds", 2)))
+        semantic_seconds = max(5.0, float(motion_config.get("semantic_interval_seconds", 10)))
+        minimum_semantic = max(1.0, float(motion_config.get("minimum_semantic_interval_seconds", 5)))
+        minimum_pose = max(0.0, min(1.0, float(motion_config.get("pose_minimum_confidence", 0.35))))
+        width, height = (float(value) for value in self.config["camera"].get("resolution", [1920, 1080]))
+        camera_id = str(self.config["camera"].get("id", "office-main"))
+        for stale_track, stale_samples in list(self._motion_samples.items()):
+            if not stale_samples or observed - stale_samples[-1]["timestamp"] > window_seconds * 2:
+                self._motion_samples.pop(stale_track, None)
+                self._motion_last_window_at.pop(stale_track, None)
+                self._motion_last_semantic_at.pop(stale_track, None)
+        created = 0
+        for item in frame.get("objects", []):
+            if str(item.get("type", "")).casefold() != "person":
+                continue
+            track_id = str(item.get("id", "")).strip()
+            pose = parse_pose(item)
+            pose = {name: point for name, point in pose.items() if point.confidence >= minimum_pose}
+            bbox = item.get("bbox") or {}
+            if not track_id or not pose or not bbox:
+                continue
+            samples = self._motion_samples.setdefault(track_id, [])
+            samples.append({
+                "timestamp": observed,
+                "pose": pose,
+                "bbox": dict(bbox),
+                "embedding": extract_embedding(item),
+            })
+            cutoff = observed - window_seconds
+            samples[:] = [sample for sample in samples if sample["timestamp"] >= cutoff]
+            if len(samples) < 2 or observed - self._motion_last_window_at.get(track_id, 0) < step_seconds:
+                continue
+            facts = summarize_motion(samples, width, height)
+            self._motion_last_window_at[track_id] = observed
+            strong_change = bool(facts.get("posture_transitions"))
+            span_seconds = samples[-1]["timestamp"] - samples[0]["timestamp"]
+            semantic_due = (
+                span_seconds >= window_seconds * 0.75
+                and observed - self._motion_last_semantic_at.get(track_id, 0) >= semantic_seconds
+            )
+            semantic_allowed = observed - self._motion_last_semantic_at.get(track_id, 0) >= minimum_semantic
+            needs_semantic = semantic_due or (span_seconds >= 2.0 and strong_change and semantic_allowed)
+            if needs_semantic:
+                self._motion_last_semantic_at[track_id] = observed
+            self._persist_motion_window(connection=None, camera_id=camera_id, track_id=track_id, samples=list(samples), facts=facts, semantic=needs_semantic, now=current)
+            created += 1
+        return created
+
+    def _persist_motion_window(
+        self,
+        connection: sqlite3.Connection | None,
+        camera_id: str,
+        track_id: str,
+        samples: list[dict[str, Any]],
+        facts: dict[str, Any],
+        semantic: bool,
+        now: float,
+    ) -> int | None:
+        start = float(facts.get("window", {}).get("start", samples[0]["timestamp"]))
+        end = float(facts.get("window", {}).get("end", samples[-1]["timestamp"]))
+        selected_person: list[tuple[float, bytes]] = []
+        selected_scene: list[tuple[float, bytes]] = []
+        person_path = ""
+        scene_path = ""
+        hand_facts: dict[str, Any] = {"available": False, "reason": "no synchronized frames", "observations": []}
+        if semantic and self.frame_buffer is not None:
+            buffered = self.frame_buffer.between(start, end)
+            motion = self.workstation.get("motion_pipeline", {})
+            selected_person = select_storyboard_frames(
+                buffered, int(motion.get("person_storyboard_frames", 6)), samples,
+            )
+            selected_scene = select_storyboard_frames(
+                buffered, int(motion.get("scene_storyboard_frames", 4)), samples,
+            )
+            base_name = f"{camera_id}_{track_id}_{int(start * 1000)}"
+            person_file = self.storyboard_dir / f"{base_name}_person.jpg"
+            scene_file = self.storyboard_dir / f"{base_name}_scene.jpg"
+            person_path = build_storyboard(selected_person, samples, person_file, person_crop=True)
+            scene_path = build_storyboard(selected_scene, samples, scene_file, person_crop=False)
+            if self.hand_analyzer is not None:
+                hand_facts = self.hand_analyzer.analyze(crop_person_frames(selected_person, samples))
+        mapping_connection = connection or self._connect()
+        owns_connection = connection is None
+        try:
+            mapping = mapping_connection.execute(
+                "SELECT person_id FROM person_track_map WHERE track_id = ?", (track_id,)
+            ).fetchone()
+            person_id = int(mapping[0]) if mapping else None
+            relative_person = str(Path(person_path).relative_to(self.database_file.parent)) if person_path else ""
+            relative_scene = str(Path(scene_path).relative_to(self.database_file.parent)) if scene_path else ""
+            summary = self._motion_summary(facts)
+            cursor = mapping_connection.execute(
+                "INSERT OR IGNORE INTO person_motion_windows("
+                "camera_id, track_id, person_id, started_at, ended_at, facts_json, motion_summary, "
+                "person_storyboard, scene_storyboard, hand_json, quality, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    camera_id, track_id, person_id, start, end, facts_json(facts), summary,
+                    relative_person, relative_scene, json.dumps(hand_facts, ensure_ascii=False),
+                    float(facts.get("quality", {}).get("pose_confidence", 0)),
+                    "pending" if semantic else "facts_only", now,
+                ),
+            )
+            if owns_connection:
+                mapping_connection.commit()
+            window_id = int(cursor.lastrowid) if cursor.lastrowid else None
+        finally:
+            if owns_connection:
+                mapping_connection.close()
+        if semantic:
+            self._trim_motion_queue(now)
+        return window_id
+
+    @staticmethod
+    def _motion_summary(facts: dict[str, Any]) -> str:
+        motion = facts.get("body_motion", {})
+        direction = str(motion.get("direction_in_image", "stationary"))
+        labels = {
+            "right_in_image": "在画面中向右移动",
+            "left_in_image": "在画面中向左移动",
+            "up_in_image": "在画面中向上移动",
+            "down_in_image": "在画面中向下移动",
+            "stationary": "身体位置基本稳定",
+        }
+        transitions = [str(item.get("type", "")) for item in facts.get("posture_transitions", [])]
+        return "；".join([labels.get(direction, direction), *transitions])[:300]
+
+    def _trim_motion_queue(self, now: float) -> None:
+        limit = max(10, int(self.workstation.get("motion_pipeline", {}).get("queue_limit", 100)))
+        with self.lock, closing(self._connect()) as connection, connection:
+            rows = connection.execute(
+                "SELECT id FROM person_motion_windows WHERE status IN ('pending', 'retry') "
+                "ORDER BY ended_at DESC"
+            ).fetchall()
+            for row in rows[limit:]:
+                connection.execute(
+                    "UPDATE person_motion_windows SET status = 'superseded', error = 'queue limit exceeded', "
+                    "next_retry_at = ? WHERE id = ?",
+                    (now, int(row[0])),
+                )
+
+    def analyze_pending_motion(self, now: float | None = None) -> dict[str, Any] | None:
+        """Analyze one latest due motion window; retry failures without blocking ingestion."""
+        current = time.time() if now is None else now
+        with self.lock, closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT * FROM person_motion_windows WHERE status IN ('pending', 'retry') "
+                "AND next_retry_at <= ? ORDER BY ended_at DESC LIMIT 1",
+                (current,),
+            ).fetchone()
+            if not row:
+                return None
+            connection.execute(
+                "UPDATE person_motion_windows SET status = 'processing', attempts = attempts + 1 WHERE id = ?",
+                (int(row["id"]),),
+            )
+        try:
+            result = self._call_motion_vlm(dict(row))
+            category = str(result.get("category", result.get("activity", "unknown"))).lower()
+            if category not in ACTIVITIES:
+                category = "unknown"
+            description = " ".join(str(result.get("description", "")).split())[:300]
+            confidence = max(0.0, min(1.0, float(result.get("confidence", 0))))
+            continues = result.get("continues_current") is True
+            observed_actions = result.get("observed_actions", [])
+            uncertainty = str(result.get("uncertainty", ""))[:300]
+            with self.lock, closing(self._connect()) as connection, connection:
+                interval_id = self._record_person_activity(
+                    connection, str(row["camera_id"]), str(row["track_id"]), category,
+                    description, confidence, continues, float(row["ended_at"]),
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO person_activity_observations("
+                    "interval_id, motion_window_id, category, description, observed_actions_json, "
+                    "continues_current, confidence, uncertainty, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        interval_id, int(row["id"]), category, description,
+                        json.dumps(observed_actions if isinstance(observed_actions, list) else [], ensure_ascii=False),
+                        int(continues), confidence, uncertainty, current,
+                    ),
+                )
+                if interval_id is not None:
+                    event_start = connection.execute(
+                        "SELECT started_at FROM person_activity_intervals WHERE id = ?", (interval_id,)
+                    ).fetchone()
+                    if event_start:
+                        connection.execute(
+                            "UPDATE person_activity_observations SET interval_id = ? "
+                            "WHERE interval_id IS NULL AND motion_window_id IN ("
+                            "SELECT id FROM person_motion_windows WHERE camera_id = ? AND track_id = ? "
+                            "AND ended_at >= ?)",
+                            (interval_id, str(row["camera_id"]), str(row["track_id"]), float(event_start[0])),
+                        )
+                connection.execute(
+                    "UPDATE person_motion_windows SET status = 'complete', error = '', next_retry_at = 0 "
+                    "WHERE id = ?",
+                    (int(row["id"]),),
+                )
+            return {"window_id": int(row["id"]), "category": category, "description": description, "confidence": confidence}
+        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError, KeyError) as error:
+            attempts = int(row["attempts"] or 0) + 1
+            delay = min(3600, 10 * (2 ** min(attempts, 8)))
+            with self.lock, closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "UPDATE person_motion_windows SET status = 'retry', error = ?, next_retry_at = ? WHERE id = ?",
+                    (str(error)[:500], current + delay, int(row["id"])),
+                )
+            self.last_vlm_error = str(error)
+            return None
+
+    def _call_motion_vlm(self, window: dict[str, Any]) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            current_event = self._current_person_event(connection, str(window["track_id"]))
+        context = None if not current_event else {
+            "category": str(current_event["activity"]),
+            "description": str(current_event["description"] or ""),
+        }
+        evidence = {
+            "person_id": window.get("person_id"),
+            "track_id": window["track_id"],
+            "window": {"start": window["started_at"], "end": window["ended_at"]},
+            "body_motion": json.loads(str(window["facts_json"])),
+            "hand_motion": json.loads(str(window["hand_json"] or "{}")),
+            "current_event": context,
+        }
+        prompt = (
+            "你将收到同一人员连续时间窗的结构化运动测量、人物近景故事板和环境故事板。"
+            "测量是证据，不是活动标签；z只表示单目模型估计的相对前后变化。"
+            "先描述可观察的动作，再结合环境判断活动。禁止猜测屏幕内容、文件名、谈话主题、业务目的、身份或敏感属性。"
+            "证据不足时明确写无法判断。description必须是自然、自由且简短的中文，不要使用固定模板。"
+            "只返回JSON："
+            '{"category":"computer|reading|writing|phone|conversation|eating|rest|unknown",'
+            '"description":"自由中文描述","observed_actions":["可见动作"],'
+            '"continues_current":true,"confidence":0.0,"uncertainty":"不确定原因"}\n'
+            f"运动证据：{json.dumps(evidence, ensure_ascii=False)}"
+        )
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for key in ("person_storyboard", "scene_storyboard"):
+            relative = str(window.get(key, ""))
+            path = self.database_file.parent / relative
+            if relative and path.is_file():
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode("ascii")},
+                })
+        payload = {
+            "model": self._model(),
+            "messages": [{"role": "user", "content": content}],
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": 768,
+        }
+        return self._post_vlm(payload)
 
     def _close_uncertain_session(self, connection: sqlite3.Connection, recovered_at: float) -> None:
         """Close an open session across an outage without inventing a departure event."""
@@ -1481,6 +2106,15 @@ class WorkstationEngine:
             connection.execute("DELETE FROM workstation_activity_intervals WHERE COALESCE(ended_at, started_at) < ?", (cutoff,))
             connection.execute("DELETE FROM workstation_sessions WHERE COALESCE(ended_at, started_at) < ?", (cutoff,))
             connection.execute("DELETE FROM workstation_away_events WHERE COALESCE(ended_at, started_at) < ?", (cutoff,))
+            connection.execute(
+                "DELETE FROM person_activity_intervals WHERE COALESCE(ended_at, last_observed_at, started_at) < ?",
+                (cutoff,),
+            )
+            connection.execute(
+                "DELETE FROM person_seated_intervals WHERE COALESCE(ended_at, last_seen_at, started_at) < ?",
+                (cutoff,),
+            )
+            connection.execute("DELETE FROM person_verifications WHERE created_at < ?", (cutoff,))
         clip_cutoff = current - int(self.workstation.get("event_clip_retention_days", 7)) * 86400
         with closing(self._connect()) as connection, connection:
             expired = connection.execute(
@@ -1490,6 +2124,27 @@ class WorkstationEngine:
                 if clip_path:
                     Path(clip_path).unlink(missing_ok=True)
                 connection.execute("DELETE FROM workstation_events WHERE id = ?", (event_id,))
+        motion = self.workstation.get("motion_pipeline", {})
+        evidence_days = int(motion.get("storyboard_retention_days", motion.get("retention_days", 7)))
+        evidence_cutoff = current - evidence_days * 86400
+        with closing(self._connect()) as connection, connection:
+            expired_windows = connection.execute(
+                "SELECT id, person_storyboard, scene_storyboard FROM person_motion_windows WHERE ended_at < ?",
+                (evidence_cutoff,),
+            ).fetchall()
+            root = self.database_file.parent.resolve()
+            for window_id, person_storyboard, scene_storyboard in expired_windows:
+                for relative in (person_storyboard, scene_storyboard):
+                    if not relative:
+                        continue
+                    path = (root / str(relative)).resolve()
+                    if root in path.parents:
+                        path.unlink(missing_ok=True)
+                connection.execute(
+                    "DELETE FROM person_activity_observations WHERE motion_window_id = ?", (window_id,)
+                )
+                connection.execute("DELETE FROM person_motion_windows WHERE id = ?", (window_id,))
+            connection.execute("DELETE FROM motion_frame_tokens WHERE observed_at < ?", (current - 86400,))
 
     def mark_overtime(self, now: float | None = None) -> None:
         current = time.time() if now is None else now
@@ -1670,6 +2325,24 @@ class WorkstationEngine:
                 event["source_ids"] = [event["id"]]
                 merged.append(event)
 
+        with closing(self._connect()) as evidence_connection:
+            for event in merged:
+                placeholders = ",".join("?" for _ in event["source_ids"])
+                observation = evidence_connection.execute(
+                    "SELECT o.*, w.motion_summary, w.status AS evidence_status, w.id AS window_id, "
+                    "w.person_storyboard, w.scene_storyboard "
+                    "FROM person_activity_observations o "
+                    "JOIN person_motion_windows w ON w.id = o.motion_window_id "
+                    f"WHERE o.interval_id IN ({placeholders}) ORDER BY o.created_at DESC LIMIT 1",
+                    tuple(event["source_ids"]),
+                ).fetchone()
+                event["motion_summary"] = str(observation["motion_summary"]) if observation else ""
+                event["evidence_status"] = str(observation["evidence_status"]) if observation else "unavailable"
+                event["storyboard_url"] = (
+                    f"/api/activity/evidence/{int(observation['window_id'])}/person"
+                    if observation and observation["person_storyboard"] else ""
+                )
+
         summaries: dict[str, dict[str, Any]] = {}
         for event in merged:
             key = str(event["person_id"]) if event["person_id"] is not None else f"track:{event['track_id']}"
@@ -1695,6 +2368,84 @@ class WorkstationEngine:
             "total_seconds": sum(int(item["duration_seconds"]) for item in merged),
         }
 
+    def activity_event_detail(self, event_id: int) -> dict[str, Any] | None:
+        """Return the observation trail and measurable evidence for one raw activity interval."""
+        with closing(self._connect()) as connection:
+            event = connection.execute(
+                "SELECT a.*, COALESCE(a.person_id, m.person_id) AS resolved_person_id, p.name AS person_name "
+                "FROM person_activity_intervals a "
+                "LEFT JOIN person_track_map m ON m.track_id = a.track_id "
+                "LEFT JOIN people p ON p.id = COALESCE(a.person_id, m.person_id) WHERE a.id = ?",
+                (event_id,),
+            ).fetchone()
+            if not event:
+                return None
+            observations = connection.execute(
+                "SELECT o.*, w.started_at AS window_started_at, w.ended_at AS window_ended_at, "
+                "w.facts_json, w.hand_json, w.motion_summary, w.status AS evidence_status, "
+                "w.id AS window_id, w.person_storyboard, w.scene_storyboard "
+                "FROM person_activity_observations o JOIN person_motion_windows w ON w.id = o.motion_window_id "
+                "WHERE o.interval_id = ? ORDER BY o.created_at",
+                (event_id,),
+            ).fetchall()
+        return {
+            "id": int(event["id"]),
+            "person_id": int(event["resolved_person_id"]) if event["resolved_person_id"] is not None else None,
+            "person_name": str(event["person_name"] or f"人员 {event['track_id']}"),
+            "track_id": str(event["track_id"]),
+            "category": str(event["activity"]),
+            "description": str(event["description"] or ACTIVITY_LABELS.get(str(event["activity"]), "")),
+            "started_at": float(event["started_at"]),
+            "ended_at": float(event["ended_at"] or event["last_observed_at"] or event["started_at"]),
+            "observations": [{
+                "id": int(row["id"]),
+                "window_id": int(row["window_id"]),
+                "window": {"start": float(row["window_started_at"]), "end": float(row["window_ended_at"])},
+                "category": str(row["category"]),
+                "description": str(row["description"]),
+                "observed_actions": json.loads(str(row["observed_actions_json"] or "[]")),
+                "continues_current": bool(row["continues_current"]),
+                "confidence": float(row["confidence"]),
+                "uncertainty": str(row["uncertainty"]),
+                "motion_summary": str(row["motion_summary"]),
+                "motion_facts": json.loads(str(row["facts_json"])),
+                "hand_motion": json.loads(str(row["hand_json"] or "{}")),
+                "evidence_status": str(row["evidence_status"]),
+                "storyboards": {
+                    "person": f"/api/activity/evidence/{int(row['window_id'])}/person" if row["person_storyboard"] else "",
+                    "scene": f"/api/activity/evidence/{int(row['window_id'])}/scene" if row["scene_storyboard"] else "",
+                },
+            } for row in observations],
+        }
+
+    def evidence_image(self, window_id: int, kind: str) -> Path | None:
+        column = "person_storyboard" if kind == "person" else "scene_storyboard" if kind == "scene" else ""
+        if not column:
+            return None
+        with closing(self._connect()) as connection:
+            row = connection.execute(f"SELECT {column} FROM person_motion_windows WHERE id = ?", (window_id,)).fetchone()
+        if not row or not row[0]:
+            return None
+        path = (self.database_file.parent / str(row[0])).resolve()
+        root = self.database_file.parent.resolve()
+        return path if path.is_file() and (path == root or root in path.parents) else None
+
+    def motion_status(self, now: float | None = None) -> dict[str, Any]:
+        current = time.time() if now is None else now
+        with closing(self._connect()) as connection:
+            last_seen = float(self._state(connection, "motion_worker_last_seen", "0") or 0)
+            pending = connection.execute(
+                "SELECT COUNT(*) FROM person_motion_windows WHERE status IN ('pending', 'retry', 'processing')"
+            ).fetchone()[0]
+        return {
+            "enabled": bool(self.workstation.get("motion_pipeline", {}).get("enabled", True)),
+            "healthy": bool(last_seen and current - last_seen < 15),
+            "last_seen_at": last_seen or None,
+            "worker_seen_within_seconds": round(current - last_seen, 3) if last_seen else None,
+            "pending_windows": int(pending),
+            "last_error": self.last_vlm_error,
+        }
+
     def people_list(self, now: float | None = None) -> list[dict[str, Any]]:
         """已注册人员列表：名字、参考图（相对路径）、首见/末见时间、关联 track 数。"""
         current = time.time() if now is None else now
@@ -1702,7 +2453,9 @@ class WorkstationEngine:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 "SELECT p.id, p.name, p.reference_image, p.first_seen_at, p.last_seen_at, "
-                "(SELECT COUNT(*) FROM person_track_map m WHERE m.person_id = p.id) AS track_count "
+                "(SELECT COUNT(*) FROM person_track_map m WHERE m.person_id = p.id) AS track_count, "
+                "(SELECT COUNT(*) FROM person_reference_images r WHERE r.person_id = p.id AND r.active = 1) "
+                "AS image_count "
                 "FROM people p WHERE p.active = 1 ORDER BY p.last_seen_at DESC"
             ).fetchall()
         return [
@@ -1713,9 +2466,37 @@ class WorkstationEngine:
                 "first_seen_at": float(row["first_seen_at"]),
                 "last_seen_at": float(row["last_seen_at"]),
                 "track_count": int(row["track_count"]),
+                "image_count": int(row["image_count"]),
             }
             for row in rows
         ]
+
+    def person_gallery(self, person_id: int) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, captured_at, quality_score, is_cover FROM person_reference_images "
+                "WHERE person_id = ? AND active = 1 ORDER BY is_cover DESC, quality_score DESC",
+                (person_id,),
+            ).fetchall()
+        return [{
+            "image_id": int(row["id"]),
+            "captured_at": float(row["captured_at"]),
+            "quality_score": float(row["quality_score"]),
+            "is_cover": bool(row["is_cover"]),
+            "url": f"/api/people/{person_id}/images/{int(row['id'])}",
+        } for row in rows]
+
+    def person_gallery_image(self, person_id: int, image_id: int) -> Path | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT path FROM person_reference_images WHERE id = ? AND person_id = ? AND active = 1",
+                (image_id, person_id),
+            ).fetchone()
+        if not row:
+            return None
+        path = (self.database_file.parent / str(row[0])).resolve()
+        root = self.database_file.parent.resolve()
+        return path if path.is_file() and root in path.parents else None
 
     def person_image(self, person_id: int) -> Path | None:
         with closing(self._connect()) as connection:
@@ -1740,6 +2521,9 @@ class WorkstationEngine:
             connection.execute(
                 "DELETE FROM person_track_map WHERE person_id = ?", (person_id,)
             )
+            connection.execute(
+                "UPDATE person_reference_images SET active = 0, is_cover = 0 WHERE person_id = ?", (person_id,)
+            )
         return True
 
     def rename_person(self, person_id: int, name: str) -> bool:
@@ -1755,9 +2539,11 @@ def worker(engine: WorkstationEngine, fetch_frame: Any, poll_seconds: float = 2.
     while True:
         try:
             engine.process_frame(fetch_frame())
-            if engine.needs_vlm_sample():
+            motion_enabled = engine.workstation.get("motion_pipeline", {}).get("enabled", True)
+            if not motion_enabled and engine.needs_vlm_sample():
                 engine.analyze_activity()
-            engine.sample_next_person()
+            if not motion_enabled:
+                engine.sample_next_person()
             engine._drain_person_pending()  # noqa: SLF001 - worker 主循环异步消费新 track 判定
             engine.mark_overtime()
             engine.archive_pending_clips()

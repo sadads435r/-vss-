@@ -27,6 +27,13 @@ model_parent="$(dirname -- "${model_dir}")"; mkdir -p "${model_parent}"
 available_gb="$(df -Pk "${model_parent}" | awk 'NR==2 {printf "%d", $4/1024/1024}')"
 [[ "${available_gb}" -ge 40 || -f "${model_dir}/config.json" ]] || { echo "[FAIL] Cosmos3-Nano needs 40 GB free for its initial download; found ${available_gb} GB" >&2; errors=$((errors + 1)); }
 
+if [[ "$(read_env MOTION_MODELS_AUTO_DOWNLOAD)" == "false" ]]; then
+  [[ -f "${REPO_ROOT}/data/models/bodypose3dnet/bodypose3dnet_accuracy.onnx" ]] \
+    || { echo "[FAIL] BodyPose3DNet is missing while MOTION_MODELS_AUTO_DOWNLOAD=false" >&2; errors=$((errors + 1)); }
+  [[ -f "${REPO_ROOT}/data/models/mediapipe/hand_landmarker.task" ]] \
+    || { echo "[FAIL] MediaPipe Hand Landmarker is missing while MOTION_MODELS_AUTO_DOWNLOAD=false" >&2; errors=$((errors + 1)); }
+fi
+
 docker compose --env-file "${OFFICE_ENV}" -f "${OFFICE_COMPOSE}" config --quiet \
   || { echo "[FAIL] Office Compose configuration is invalid" >&2; errors=$((errors + 1)); }
 

@@ -10,3 +10,9 @@ paths:
   all_others:
     source: publisher
     sourceOnDemand: no
+    record: yes
+    recordPath: /recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordFormat: fmp4
+    recordPartDuration: 1s
+    recordSegmentDuration: 2s
+    recordDeleteAfter: 2m

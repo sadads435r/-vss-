@@ -1,8 +1,8 @@
-# VSS 单工位专注助手（DGX Spark）
+# VSS 每日活动与连续动作助手（DGX Spark）
 
-本项目只分析一个固定椅子 ROI 内的匿名使用者。RT-CV 持续检测人物；只有最新帧中人物框底部中心位于椅子 ROI 时，Office API 才每 20 秒调用一次本地 `nvidia/Cosmos3-Nano` 16B Reasoner。离开椅子后不会调用 Cosmos3，也不做人脸识别或跨天身份关联。
+本项目分析单摄像头内 1–3 名人员的连续活动。RT-CV 的 NvDCF 负责人物框、track、ReID 与 BodyPose3DNet 34 个 2D/3D 关键点；独立 motion worker 在 8 秒窗口内计算关节角度、速度、画面内方向与相对 z 变化，并为 Cosmos3 生成同步的人物/环境故事板。MediaPipe 只对人物关键帧补充 21 点手部细节。Cosmos3 根据这些事实生成保守的自由中文描述，椅子 ROI 仅继续服务于旧的在座/日报统计。
 
-本扩展在 NVIDIA VSS `dev-profile-alerts` 之上增加单路 USB 摄像头、匿名办公事件分类、事件面板和内网 HTTPS 入口。VSS 核心服务保持原样，便于定位官方组件问题。
+本扩展在 NVIDIA VSS `dev-profile-alerts` 之上增加单路 USB 摄像头、自动人员库、连续动作窗口、活动时间线和内网 HTTPS 入口。VSS 核心服务保持原样，便于定位官方组件问题。
 
 ## 1. Spark 前置条件
 
@@ -12,7 +12,7 @@
 - 一个可用的 NVIDIA NGC API key，以及允许下载所需模型的凭据。
 - 一台支持 1920×1080 MJPEG 或 raw 输出的 USB 摄像头。
 
-## 2. 下载 Cosmos3-Nano 16B
+## 2. 下载模型
 
 `.env` 中默认使用 NVIDIA 官方仓库并固定到已验证提交：
 
@@ -23,6 +23,8 @@ COSMOS3_MODEL_DIR=/home/shiyiming/models/Cosmos3-Nano
 ```
 
 执行 `bash ./scripts/download-cosmos3-nano.sh` 可单独下载。模型约 32.6 GiB，断线后再次执行会自动续传；权重保存在宿主机，停止或重建容器不会重新下载。`install.sh` 默认自动执行这一步；已有完整权重时可设置 `COSMOS3_AUTO_DOWNLOAD=false`。
+
+执行 `bash ./scripts/download-motion-models.sh` 会下载固定版本的 BodyPose3DNet accuracy ONNX 与 MediaPipe Hand Landmarker，并校验官方对象摘要。它们保存在 `data/models`；`MOTION_MODELS_AUTO_DOWNLOAD=false` 可关闭自动下载。Office 镜像固定使用提供 Linux aarch64/Python 3.12 wheel 的 MediaPipe 0.10.18，以兼容 DGX Spark。
 
 服务使用 DGX Spark 可用的多架构 NGC vLLM 26.07 镜像，并安装 NVIDIA Cosmos3 Reasoner 插件。它监听宿主机回环地址 `127.0.0.1:8018`，不会暴露给办公网。旧 VSS `vss-rtvi-vlm` 会停止，避免两套 VLM 同时占用统一内存；RT-CV、VST、Kafka、Elasticsearch 等 VSS 服务继续使用。
 
@@ -37,7 +39,7 @@ cp config/office-config.example.yaml config/office-config.yaml
 
 编辑 `config/office-config.yaml`，确认工作时间、节假日、人数上限和 ROI。ROI 坐标以画面左上角为 `(0,0)`、右下角为 `(1,1)`。示例 ROI 只是占位值，正式告警前必须现场标定。
 
-RT-CV 工位检测默认每 2 秒读取 Elasticsearch 最新的 `mdx-frames-*` 帧。人物框底部中心进入椅子 ROI 后立即显示在座；离开椅子超过 `workstation.departure_seconds`（默认 60 秒）才记录一次离座。多摄像头环境必须填写 `camera.vss_sensor_id`，避免统计其他摄像头。
+RT-CV 对 10 FPS 输入每隔一帧执行一次 BodyPose，motion worker 直接消费 Kafka `mdx-raw`，避免人物框、关键点与故事板时间错位。每 2 秒落一份运动事实，通常每 10 秒或在明显姿态变化时请求一次 Cosmos3；同一人员最短 5 秒请求一次。单目 z 只解释为人物局部相对前后变化，未标定时移动方向只写“画面中向左/向右”。多摄像头环境必须填写 `camera.vss_sensor_id`。
 
 安装后打开 `/office`，首页按日期和人员展示连续活动时间线，可用关键词筛选。展开“人员与摄像头设置”，在“椅子 ROI 标定”中只框住椅面和正常坐姿区域。活动主类固定为电脑、阅读、书写、手机、交谈、吃东西、休息和无法判断；模型只生成画面证据支持的简短描述，不推测屏幕内容或业务目的。相同事件会持续延长，只有连续两次确认变化才会拆分成新的时间段。
 
@@ -52,17 +54,17 @@ RT-CV 工位检测默认每 2 秒读取 Elasticsearch 最新的 `mdx-frames-*` �
 
 默认入口为 `https://<SPARK_IP>:8443/office`，VSS 聊天位于同一入口根路径。Caddy 使用本地 CA；将 `deploy/docker/developer-profiles/office-assistant/caddy-data/caddy/pki/authorities/local/root.crt` 导入受信任办公终端，或替换 Caddyfile 使用组织签发的证书。
 
-办公面板在查看当天时自动刷新活动事件与当前人数；历史日期保持静态。活动日志接口为 `GET /office-api/api/activity/events?date=YYYY-MM-DD`，也可使用 `start`、`end`、`person_id` 和 `q` 参数。原有工位结构化接口 `GET /office-api/api/workstation/live` 和 `GET /office-api/api/workstation/reports` 保持兼容。VSS Agent 的 `office_activity_query` 工具可按日期、时间、人员或关键词读取同一份日志。
+办公面板在查看当天时自动刷新；点击事件可查看动作事实、不确定性以及人物/环境故事板，点击人员照片可查看最多 5 张参考图。列表接口为 `GET /office-api/api/activity/events`，详情接口为 `GET /office-api/api/activity/events/{id}`，人员图库为 `GET /office-api/api/people/{id}/images`。旧的工位、人数、ROI 与日报接口保持兼容。Agent 可先查询活动，再用 `event_id` 读取证据回答“为什么这样判断”。
 
 安装脚本会尝试通过 VSS Agent API 自动注册 `rtsp://127.0.0.1:8554/office-main`。如果 VSS 启动较慢导致注册失败，可在 VSS 的 Video Management 页面手动添加同一 URL。
 
 ## 5. 数据与隐私
 
-- 不启用人脸识别，不保存人脸模板，不推断人员身份或敏感属性。
-- RT-CV 只负责人物检测、跟踪和椅子 ROI 门控；只有椅子当前有人时才调用 Cosmos3-Nano 进行行为分类。
-- Cosmos3 只返回受控行为主类及简短可见动作描述；不读取屏幕私密内容，也不推断身份或敏感属性。
-- VIOS 循环缓冲默认限制为 128 MB；Office API 每分钟归档新事件片段到 `data/office-assistant/clips`。
-- `data/office-assistant` 保存人工确认和事件片段；本地清理线程删除超过 7 天的片段。
+- 自动人员库使用 RT-CV ReID 召回候选，并由 Cosmos3 对参考截图做两次保守确认；它不是生物识别认证，不能用于权限或执法决定。
+- 只保存最多 5 张达到尺寸、置信度、关键点可见率和清晰度阈值的参考图；不推断姓名、民族、健康、情绪等敏感属性。
+- Cosmos3 不猜测屏幕内容、文件名、谈话主题或业务目的；分类仅用于统计，网页以保守自由描述为主。
+- MediaMTX 只保留 120 秒滚动 fMP4；人物/环境故事板和运动窗口保留 7 天，活动事件与统计保留 365 天，人员参考图库随人员档案保留。
+- 身份不确定时显示“待确认人员”，优先避免错误合并；关闭 `workstation.motion_pipeline.enabled` 可回退旧单图活动分析。
 - VSS Elasticsearch ILM 在部署时设置为 7 天。VIOS 的临时录像策略仍应在上线前通过 VSS 配置和磁盘检查确认。
 
 ## 6. 网络安全

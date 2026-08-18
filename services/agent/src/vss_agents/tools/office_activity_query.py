@@ -56,6 +56,11 @@ class OfficeActivityQueryInput(BaseModel):
     person: str | None = Field(None, description="Person name or a case-insensitive part of the name")
     keyword: str | None = Field(None, description="Activity keyword, such as 阅读, 交谈, or writing")
     limit: int = Field(200, ge=1, le=500, description="Maximum number of detailed events to return")
+    event_id: int | None = Field(
+        None,
+        ge=1,
+        description="Raw event id. Use this after a list query when the user asks why an activity was inferred.",
+    )
 
 
 class OfficeActivityQueryOutput(BaseModel):
@@ -68,6 +73,7 @@ class OfficeActivityQueryOutput(BaseModel):
     total_seconds: int = 0
     people: list[dict[str, object]] = Field(default_factory=list)
     events: list[dict[str, object]] = Field(default_factory=list)
+    event_detail: dict[str, object] | None = None
     truncated: bool = False
     error: str | None = None
 
@@ -77,9 +83,12 @@ async def fetch_office_activity(
     input_data: OfficeActivityQueryInput,
 ) -> OfficeActivityQueryOutput:
     """Fetch activity events and apply the optional human-readable person filter."""
-    url = f"{config.office_api_url.rstrip('/')}/api/activity/events"
+    base_url = f"{config.office_api_url.rstrip('/')}/api/activity/events"
+    url = f"{base_url}/{input_data.event_id}" if input_data.event_id else base_url
     params: dict[str, str] = {}
-    if input_data.date:
+    if input_data.event_id:
+        params = {}
+    elif input_data.date:
         params["date"] = input_data.date
     else:
         if input_data.start:
@@ -100,6 +109,15 @@ async def fetch_office_activity(
     except (TypeError, ValueError) as error:
         logger.error("Office activity API returned invalid data: %s", error)
         return OfficeActivityQueryOutput(error=f"Invalid office activity response: {error}")
+
+    if input_data.event_id:
+        if not isinstance(data, dict):
+            return OfficeActivityQueryOutput(error="Invalid office activity detail response")
+        return OfficeActivityQueryOutput(
+            event_count=1,
+            events=[data],
+            event_detail=data,
+        )
 
     raw_events = data.get("events", []) if isinstance(data, dict) else []
     events = [event for event in raw_events if isinstance(event, dict)]
@@ -141,7 +159,7 @@ async def office_activity_query(config: OfficeActivityQueryConfig, _builder: Bui
     """Register the read-only office activity query tool."""
 
     async def _office_activity_query(input_data: OfficeActivityQueryInput) -> OfficeActivityQueryOutput:
-        """Query what recognized people did during a date or time range."""
+        """Query activities; pass event_id to explain an inference from motion facts and storyboards."""
         return await fetch_office_activity(config, input_data)
 
     yield FunctionInfo.create(

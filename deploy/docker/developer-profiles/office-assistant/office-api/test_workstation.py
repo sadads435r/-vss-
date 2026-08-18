@@ -39,6 +39,27 @@ def frame(timestamp: str, *, inside: bool = True) -> dict:
     }]}
 
 
+def motion_frame(timestamp: float, center_x: float) -> dict:
+    points = []
+    for index, name in enumerate((
+        "pelvis", "left_hip", "right_hip", "torso", "left_knee", "right_knee", "neck",
+        "left_ankle", "right_ankle", "left_big_toe", "right_big_toe", "left_small_toe",
+        "right_small_toe", "left_heel", "right_heel", "nose", "left_eye", "right_eye",
+        "left_ear", "right_ear", "left_shoulder", "right_shoulder", "left_elbow",
+        "right_elbow", "left_wrist", "right_wrist", "left_pinky", "right_pinky",
+        "left_index", "right_index", "left_thumb", "right_thumb", "head_top", "spine",
+    )):
+        points.append({"name": name, "x": center_x + index, "y": 200 + index, "z": index / 100, "confidence": 0.95})
+    return {
+        "id": f"motion-{timestamp}", "sensorId": "sensor-1", "timestamp": timestamp,
+        "objects": [{
+            "id": "person-1", "type": "Person", "confidence": 0.95,
+            "bbox": {"leftX": center_x - 50, "rightX": center_x + 50, "topY": 100, "bottomY": 800},
+            "pose": {"keypoints": points}, "embedding": {"vector": [0.1, 0.2, 0.3]},
+        }],
+    }
+
+
 class WorkstationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -126,6 +147,54 @@ class WorkstationTest(unittest.TestCase):
             count = connection.execute("SELECT COUNT(*) FROM person_activity_intervals").fetchone()[0]
         self.assertTrue({"person_id", "description", "last_observed_at", "observation_count"} <= columns)
         self.assertEqual(count, 1)
+
+    def test_legacy_cover_is_migrated_to_gallery_once(self) -> None:
+        image = Path(self.temp.name) / "people" / "legacy.jpg"
+        image.parent.mkdir(exist_ok=True)
+        image.write_bytes(b"jpeg")
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                "INSERT INTO people(name, first_seen_at, last_seen_at, reference_image) "
+                "VALUES ('旧人员', 10, 20, 'people/legacy.jpg')"
+            )
+        initialize_schema(self.database)
+        initialize_schema(self.database)
+        with closing(sqlite3.connect(self.database)) as connection:
+            rows = connection.execute(
+                "SELECT person_id, path, is_cover FROM person_reference_images"
+            ).fetchall()
+        self.assertEqual(rows, [(1, "people/legacy.jpg", 1)])
+
+    def test_activity_does_not_end_while_person_is_visible_outside_roi(self) -> None:
+        observed = datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp()
+        with closing(self.engine._connect()) as connection, connection:
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "computer", "在电脑前工作", 0.9, False, observed,
+            )
+            self.engine._record_person_activity(
+                connection, "office-main", "person-1", "computer", "在电脑前工作", 0.9, False, observed + 1,
+            )
+        self.engine.process_frame(frame("2026-08-10T01:02:00Z", inside=False), now=observed + 120)
+        with closing(sqlite3.connect(self.database)) as connection:
+            ended_at = connection.execute(
+                "SELECT ended_at FROM person_activity_intervals ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertIsNone(ended_at)
+
+    def test_motion_frames_create_facts_and_one_semantic_window(self) -> None:
+        started = 1_787_000_000.0
+        for offset in range(9):
+            self.engine.process_motion_frame(motion_frame(started + offset, 200 + offset * 20), now=started + offset)
+        with closing(sqlite3.connect(self.database)) as connection:
+            statuses = [row[0] for row in connection.execute(
+                "SELECT status FROM person_motion_windows ORDER BY started_at"
+            ).fetchall()]
+            facts = connection.execute(
+                "SELECT facts_json FROM person_motion_windows ORDER BY ended_at DESC LIMIT 1"
+            ).fetchone()[0]
+        self.assertIn("pending", statuses)
+        self.assertIn("facts_only", statuses)
+        self.assertIn('"direction_in_image":"right_in_image"', facts)
 
     def test_activity_query_filters_person_and_keyword(self) -> None:
         observed = datetime(2026, 8, 10, 9, 0, tzinfo=ZoneInfo("Asia/Hong_Kong")).timestamp()

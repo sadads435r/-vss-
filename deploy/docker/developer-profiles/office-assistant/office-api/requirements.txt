@@ -1,3 +1,6 @@
 PyYAML==6.0.2
 Pillow==11.3.0
 tzdata==2025.2
+confluent-kafka==2.11.1
+# 0.10.18 is pinned because it publishes CPython 3.12 Linux aarch64 wheels for DGX Spark.
+mediapipe==0.10.18

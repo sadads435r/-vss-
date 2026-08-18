@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 COPY workstation.py .
+COPY motion.py .
+COPY motion_worker.py .
 COPY static ./static
 
 USER 65532:65532

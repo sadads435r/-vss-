@@ -72,6 +72,7 @@ COSMOS3_MODEL_DIR=/home/shiyiming/models/Cosmos3-Nano
 COSMOS3_API_PORT=8018
 COSMOS3_IMAGE=vss-office-cosmos3-nano:26.07
 COSMOS3_AUTO_DOWNLOAD=true
+MOTION_MODELS_AUTO_DOWNLOAD=true
 ```
 
 如果 Spark 用户名不是 `shiyiming`，必须把 `COSMOS3_MODEL_DIR` 改成自己的绝对路径。然后执行：
@@ -83,7 +84,7 @@ COSMOS3_AUTO_DOWNLOAD=true
 ./scripts/status.sh
 ```
 
-安装脚本会下载权重、启动 VSS、USB 摄像头网关、Cosmos3 服务和 Office API，并尝试把 `office-main` 自动注册到 RT-CV。权重保存在 `COSMOS3_MODEL_DIR`，停止或重建容器不会重新下载。
+安装脚本会下载 Cosmos3、BodyPose3DNet 和 MediaPipe Hand Landmarker，启动 VSS、USB 摄像头网关、连续动作 worker、Cosmos3 服务和 Office API，并尝试把 `office-main` 自动注册到 RT-CV。大模型权重保存在 `COSMOS3_MODEL_DIR`，动作模型保存在 `data/models`，停止或重建容器不会重新下载。
 
 ## 已有 Spark 安装更新
 

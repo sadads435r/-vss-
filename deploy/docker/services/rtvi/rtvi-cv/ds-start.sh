@@ -12,6 +12,7 @@ STREAM_TYPE="${STREAM_TYPE:-kafka}"
 DS_MODE_FLAG="${DS_MODE_FLAG:-1}"
 DS_MESSAGE_RATE="${DS_MESSAGE_RATE:-1}"
 DS_TRACKER_REID="${DS_TRACKER_REID:-false}"
+DS_BODYPOSE_ENABLED="${DS_BODYPOSE_ENABLED:-false}"
 DS_SHOW_SENSOR_ID="${DS_SHOW_SENSOR_ID:-false}"
 
 # Prepend core DeepStream plugin dirs so GStreamer can find nvvideoconvert and
@@ -181,6 +182,40 @@ start_rtdetr_gdino()
     # vectors to mdx-raw messages (reidType is already 2 in the image-provided yml).
     grep -q "outputReidTensor" "$TRACKER_CONFIG" || \
         sed -i '/^[[:space:]]*reidType: 2/a\  outputReidTensor: 1' "$TRACKER_CONFIG"
+
+    # NvDCF can run BodyPose3DNet on each tracked person and attach synchronized
+    # 34-point pose metadata. An interval of 1 means every second input frame.
+    if [[ "$DS_BODYPOSE_ENABLED" == "true" ]]; then
+        BODYPOSE_ONNX=${DS_BODYPOSE_ONNX:-/opt/storage/bodypose3dnet/bodypose3dnet_accuracy.onnx}
+        BODYPOSE_ENGINE=${DS_BODYPOSE_ENGINE:-/opt/engines/bodypose3dnet/bodypose3dnet_accuracy.onnx_b1_gpu0_fp16.engine}
+        BODYPOSE_INTERVAL=${DS_BODYPOSE_INTERVAL:-1}
+        BODYPOSE_CLASS_IDS=${DS_BODYPOSE_CLASS_IDS:-"[0]"}
+        if [[ ! -f "$BODYPOSE_ONNX" ]]; then
+            echo "ERROR: BodyPose3DNet model is missing: $BODYPOSE_ONNX" >&2
+            exit 1
+        fi
+        mkdir -p "$(dirname "$BODYPOSE_ENGINE")"
+        sed -i '/^PoseEstimator:/,$d' "$TRACKER_CONFIG"
+        cat >> "$TRACKER_CONFIG" <<EOF
+
+PoseEstimator:
+  poseEstimatorType: 1
+  useVPICropScaler: 1
+  batchSize: 1
+  workspaceSize: 1000
+  inferDims: [3, 256, 192]
+  networkMode: 1
+  inputOrder: 0
+  colorFormat: 0
+  offsets: [123.6750, 116.2800, 103.5300]
+  netScaleFactor: 0.00392156
+  onnxFile: "$BODYPOSE_ONNX"
+  modelEngineFile: "$BODYPOSE_ENGINE"
+  poseInferenceInterval: $BODYPOSE_INTERVAL
+  operateOnClassIds: $BODYPOSE_CLASS_IDS
+EOF
+        echo "##### BodyPose3DNet enabled (interval=$BODYPOSE_INTERVAL) #####"
+    fi
 
     cat "$config_file"
     extra_flags=$(build_extra_flags)

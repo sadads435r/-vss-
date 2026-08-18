@@ -48,7 +48,10 @@ class ConfigTest(unittest.TestCase):
         return Path(handle.name)
 
     def test_valid_config(self) -> None:
-        self.assertEqual(load_config(self.write_config(VALID_CONFIG))["retention"]["event_days"], 7)
+        loaded = load_config(self.write_config(VALID_CONFIG))
+        self.assertEqual(loaded["retention"]["event_days"], 7)
+        self.assertTrue(loaded["workstation"]["motion_pipeline"]["enabled"])
+        self.assertEqual(loaded["workstation"]["identity"]["confirmation_samples"], 2)
 
     def test_activity_window_accepts_date_and_datetime_range(self) -> None:
         timezone = ZoneInfo("Asia/Hong_Kong")

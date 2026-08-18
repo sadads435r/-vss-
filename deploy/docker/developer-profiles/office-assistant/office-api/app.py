@@ -53,7 +53,17 @@ def load_config(path: Path = CONFIG_FILE) -> dict[str, Any]:
         raise ConfigurationError("configuration root must be a mapping")
     if not raw.get("timezone"):
         raise ConfigurationError("missing required field: timezone")
-    raw.setdefault("workstation", default_workstation_config())
+    defaults = default_workstation_config()
+    configured_workstation = raw.get("workstation", {})
+    if not isinstance(configured_workstation, dict):
+        raise ConfigurationError("workstation must be a mapping")
+    merged_workstation = {**defaults, **configured_workstation}
+    for nested in ("motion_pipeline", "identity"):
+        configured_nested = configured_workstation.get(nested, {})
+        if not isinstance(configured_nested, dict):
+            raise ConfigurationError(f"workstation.{nested} must be a mapping")
+        merged_workstation[nested] = {**defaults[nested], **configured_nested}
+    raw["workstation"] = merged_workstation
     try:
         ZoneInfo(str(raw["timezone"]))
     except (KeyError, ValueError) as error:
@@ -562,6 +572,7 @@ class OfficeHandler(BaseHTTPRequestHandler):
                     "vst": service_status(f"{VSS_VST_URL}/vst/api/v1/sensor/streams"),
                     "elasticsearch": service_status(ELASTICSEARCH_URL),
                     "rtsp_gateway": service_status("http://127.0.0.1:9997/v3/paths/list"),
+                    "motion_pipeline": self.server.workstation.motion_status(),  # type: ignore[attr-defined]
                 })
             elif parsed.path == "/api/occupancy/current":
                 self.send_json(
@@ -584,8 +595,38 @@ class OfficeHandler(BaseHTTPRequestHandler):
                         start, end, person_id=person_id, query=search,
                     ),
                 )
+            elif parsed.path.startswith("/api/activity/events/"):
+                event_id = int(parsed.path.removeprefix("/api/activity/events/").strip("/"))
+                detail = self.server.workstation.activity_event_detail(event_id)  # type: ignore[attr-defined]
+                self.send_json(HTTPStatus.OK if detail else HTTPStatus.NOT_FOUND, detail or {"error": "activity event not found"})
+            elif parsed.path.startswith("/api/activity/evidence/"):
+                parts = parsed.path.removeprefix("/api/activity/evidence/").strip("/").split("/")
+                if len(parts) != 2:
+                    raise ValueError("evidence path must contain window id and person|scene")
+                evidence = self.server.workstation.evidence_image(int(parts[0]), parts[1])  # type: ignore[attr-defined]
+                if evidence:
+                    self.send_static(evidence, "image/jpeg")
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "activity evidence not found"})
+            elif parsed.path == "/api/motion/status":
+                self.send_json(HTTPStatus.OK, self.server.workstation.motion_status())  # type: ignore[attr-defined]
             elif parsed.path == "/api/people":
                 self.send_json(HTTPStatus.OK, {"people": self.server.workstation.people_list()})  # type: ignore[attr-defined]
+            elif parsed.path.startswith("/api/people/") and "/images/" in parsed.path:
+                person_value, image_value = parsed.path.removeprefix("/api/people/").split("/images/", 1)
+                image = self.server.workstation.person_gallery_image(  # type: ignore[attr-defined]
+                    int(person_value.strip("/")), int(image_value.strip("/")),
+                )
+                if image:
+                    self.send_static(image, "image/jpeg")
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "gallery image not found"})
+            elif parsed.path.startswith("/api/people/") and parsed.path.endswith("/images"):
+                person_id = int(parsed.path.removeprefix("/api/people/").removesuffix("/images").strip("/"))
+                self.send_json(HTTPStatus.OK, {  # type: ignore[attr-defined]
+                    "person_id": person_id,
+                    "images": self.server.workstation.person_gallery(person_id),
+                })
             elif parsed.path.startswith("/api/people/") and parsed.path.endswith("/image"):
                 person_id = int(parsed.path.removeprefix("/api/people/").removesuffix("/image").strip("/"))
                 image = self.server.workstation.person_image(person_id)  # type: ignore[attr-defined]

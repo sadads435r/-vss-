@@ -44,6 +44,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./mediamtx.yml:/mediamtx.yml:ro
+      - ../../../../data/office-assistant/rolling-recordings:/recordings
 
   camera-gateway:
     build:
@@ -90,6 +91,39 @@ services:
       interval: 15s
       timeout: 3s
       retries: 10
+
+  office-motion-worker:
+    image: vss-office-assistant-office-api:latest
+    build:
+      context: ./office-api
+    container_name: office-motion-worker
+    network_mode: host
+    restart: unless-stopped
+    user: ${OFFICE_UID:-1000}:${OFFICE_GID:-1000}
+    entrypoint: ["python", "/app/motion_worker.py"]
+    environment:
+      OFFICE_CONFIG_FILE: /config/office-config.yaml
+      OFFICE_DATABASE_FILE: /data/office.db
+      OFFICE_CLIP_DIR: /data/clips
+      OFFICE_API_PORT: ${OFFICE_API_PORT:-8090}
+      OFFICE_KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP:-127.0.0.1:9092}
+      OFFICE_RTCV_TOPIC: ${MOTION_TOPIC:-mdx-raw}
+      OFFICE_MOTION_CONSUMER_GROUP: ${MOTION_GROUP:-office-motion-v1}
+    volumes:
+      - ../../../../config/:/config/:ro
+      - ../../../../data/office-assistant:/data
+      - ${MEDIAPIPE_MODEL_DIR:-../../../../data/models/mediapipe}:/models/mediapipe:ro
+    depends_on:
+      office-api:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import json,os,urllib.request; d=json.load(urllib.request.urlopen('http://127.0.0.1:'+os.environ['OFFICE_API_PORT']+'/api/motion/status',timeout=2)); v=d.get('worker_seen_within_seconds'); assert v is not None and v<60\""]
+      interval: 20s
+      timeout: 4s
+      retries: 10
+      start_period: 60s
 
   office-proxy:
     image: caddy:2.10.0-alpine

@@ -300,7 +300,7 @@ workflow:
     6. For REAL-TIME VLM ALERTS (start/stop monitoring) → DIRECTLY CALL rtvi_vlm_alert with action='start' or 'stop'
     7. For QUERYING/LISTING INCIDENTS → DIRECTLY CALL rtvi_vlm_alert with action='get_incidents'
     8. For asking how many people are in the office / working now (e.g., "当前有几个人在办公", "how many people are working", "办公室有几个人") → DIRECTLY CALL office_people_count. Optionally pass detail=true to include per-person work durations.
-    9. For asking what a person did, daily activity history, an activity around a time, or activity keyword statistics (e.g., "张三今天做了什么", "昨天十点左右发生了什么", "本周谁进行过交谈") → DIRECTLY CALL office_activity_query. Resolve relative dates from the current date and pass ISO dates/datetimes. Treat returned descriptions as conservative visual observations, not proof of private screen content or business purpose.
+    9. For asking what a person did, daily activity history, an activity around a time, or activity keyword statistics (e.g., "张三今天做了什么", "昨天十点左右发生了什么", "本周谁进行过交谈") → DIRECTLY CALL office_activity_query. Resolve relative dates from the current date and pass ISO dates/datetimes. If the user asks why an activity was inferred, first find its event id, then call office_activity_query again with event_id to cite motion facts, uncertainty, and storyboards. Treat descriptions as conservative visual observations, not proof of private screen content or business purpose.
 
     WORKFLOW 1: List Available Videos
     User: "What videos are available?" / "Show me all uploaded videos"

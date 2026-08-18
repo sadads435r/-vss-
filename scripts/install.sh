@@ -18,6 +18,9 @@ export NUM_SENSORS=1
 if [[ "$(read_env COSMOS3_AUTO_DOWNLOAD)" != "false" ]]; then
   bash "${SCRIPT_DIR}/download-cosmos3-nano.sh"
 fi
+if [[ "$(read_env MOTION_MODELS_AUTO_DOWNLOAD)" != "false" ]]; then
+  bash "${SCRIPT_DIR}/download-motion-models.sh"
+fi
 
 host_ip="$(ip route get 1.1.1.1 | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 if [[ -z "${host_ip}" ]]; then
@@ -51,7 +54,11 @@ if [[ -f "${generated_env}" ]]; then
   fi
 fi
 
-mkdir -p "${REPO_ROOT}/data/office-assistant/clips"
+mkdir -p \
+  "${REPO_ROOT}/data/office-assistant/clips" \
+  "${REPO_ROOT}/data/office-assistant/people" \
+  "${REPO_ROOT}/data/office-assistant/storyboards" \
+  "${REPO_ROOT}/data/office-assistant/rolling-recordings"
 echo "[INFO] Stopping the legacy VSS RT-VLM; workstation classification uses Cosmos3-Nano 16B instead."
 docker stop vss-rtvi-vlm >/dev/null 2>&1 || true
 echo "[INFO] Starting USB camera gateway, office API, dashboard, and HTTPS proxy..."

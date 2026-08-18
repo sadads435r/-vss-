@@ -88,6 +88,7 @@ services:
     container_name: vss-rtvi-cv
     volumes:
       - $VSS_DATA_DIR/models/:/opt/storage/
+      - $VSS_APPS_DIR/../../data/models/bodypose3dnet:/opt/storage/bodypose3dnet:ro
       - $VSS_APPS_DIR/engines/:/opt/engines/
       - $VSS_APPS_DIR/developer-profiles/dev-profile-alerts/deepstream/configs/:/opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/mounted-configs/
 
@@ -98,6 +99,12 @@ services:
       NUM_SENSORS: ${NUM_SENSORS}
       DS_MODEL_FAMILY: rtdetr-gdino
       DS_TRACKER_REID: "true"
+      DS_BODYPOSE_ENABLED: "true"
+      DS_BODYPOSE_ONNX: /opt/storage/bodypose3dnet/bodypose3dnet_accuracy.onnx
+      DS_BODYPOSE_ENGINE: /opt/engines/bodypose3dnet/bodypose3dnet_accuracy.onnx_b1_gpu0_fp16.engine
+      # 10 FPS input: interval 1 runs pose on every second frame (~5 FPS).
+      DS_BODYPOSE_INTERVAL: "1"
+      DS_BODYPOSE_CLASS_IDS: "[0]"
       DS_SHOW_SENSOR_ID: "true"
       DS_CONFIG_FILE: /opt/nvidia/deepstream/deepstream/sources/apps/sample_apps/metropolis_perception_app/configs/run_config-api-rtdetr-protobuf.txt
     depends_on:

@@ -76,3 +76,36 @@ async def test_fetch_office_activity_reports_connection_error() -> None:
     assert result.event_count == 0
     assert result.error is not None
     assert "Failed to reach office API" in result.error
+
+
+@pytest.mark.asyncio
+async def test_fetch_office_activity_detail_returns_motion_evidence() -> None:
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json = AsyncMock(return_value={
+        "id": 7,
+        "description": "从椅子上起身",
+        "observations": [{
+            "observed_actions": ["膝关节角度增大"],
+            "motion_facts": {"posture_transitions": [{"type": "stood_up"}]},
+            "storyboards": {"person": "/api/activity/evidence/4/person"},
+        }],
+    })
+    response.__aenter__ = AsyncMock(return_value=response)
+    response.__aexit__ = AsyncMock(return_value=False)
+    session = MagicMock()
+    session.get.return_value = response
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=False)
+
+    config = OfficeActivityQueryConfig(office_api_url="http://office-api:8090")
+    with patch("vss_agents.tools.office_activity_query.aiohttp.ClientSession", return_value=session):
+        result = await fetch_office_activity(config, OfficeActivityQueryInput(event_id=7))
+
+    assert result.event_count == 1
+    assert result.event_detail is not None
+    assert result.event_detail["id"] == 7
+    session.get.assert_called_once_with(
+        "http://office-api:8090/api/activity/events/7",
+        params={},
+    )
