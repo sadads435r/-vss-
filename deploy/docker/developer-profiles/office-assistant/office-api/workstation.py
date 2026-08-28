@@ -26,7 +26,9 @@ import yaml
 
 from motion import (
     MediaPipeHandAnalyzer,
+    MediaPipePoseAnalyzer,
     RtspFrameBuffer,
+    build_pose_observation,
     build_storyboard,
     cosine_similarity,
     crop_person_frames,
@@ -40,15 +42,93 @@ from motion import (
 
 ACTIVITIES = ("computer", "reading", "writing", "phone", "conversation", "eating", "rest", "unknown")
 ACTIVITY_LABELS = {
-    "computer": "电脑操作",
+    "computer": "使用电脑",
     "reading": "阅读",
     "writing": "书写",
     "phone": "使用手机",
     "conversation": "交谈",
     "eating": "吃东西",
-    "rest": "睡觉",
-    "unknown": "无法判断",
+    "rest": "睡眠",
+    "unknown": "其他动作",
+    "left_workstation": "离开工位",
+    "returned_to_workstation": "返回工位",
 }
+
+# Negative lifecycle IDs normally encode a motion-window ID.  Keep inferred
+# presence transitions in a separate range so their detail endpoint can expose
+# the seated-interval evidence without pretending that a VLM saw the departure.
+PRESENCE_LIFECYCLE_ID_BASE = 1_000_000_000_000
+
+WORKSTATION_COMPUTER_EXPLICIT = (
+    "电脑", "屏幕", "键盘", "鼠标", "触控板", "笔记本电脑", "桌面",
+)
+WORKSTATION_COMPUTER_POSTURE = (
+    "坐姿", "坐在", "办公椅", "身体前倾", "上半身", "低头", "后仰",
+    "头部", "手部", "右手", "左手", "双手", "手臂", "双臂",
+)
+WORKSTATION_COMPUTER_BLOCKERS = (
+    "站起", "起身", "行走", "走动", "离开", "手机", "进食", "吃", "饮水",
+    "喝水", "交谈", "说话", "闭眼", "打盹", "睡眠",
+)
+
+TARGET_ACTION_FORBIDDEN = (
+    "背景", "环境", "办公室", "开放式", "工位区", "其他人", "另一人", "另一名", "另一个",
+    "同事", "周围", "后方", "远处", "两人", "多人", "戴眼镜", "身穿", "穿着", "中年",
+    "年轻", "男子", "女士", "男士", "女子", "光线", "镜头前", "似乎", "看起来", "氛围",
+)
+
+
+def clean_target_actions(value: Any) -> list[str]:
+    """Keep short target-person actions and reject appearance, scene, and bystander text."""
+    if not isinstance(value, list):
+        return []
+    cleaned: list[str] = []
+    for item in value:
+        action = " ".join(str(item).split()).strip(" ，。；、")
+        if not action or any(marker in action for marker in TARGET_ACTION_FORBIDDEN):
+            continue
+        if action not in cleaned:
+            cleaned.append(action[:80])
+    return cleaned[:4]
+
+
+def infer_activity_from_actions(
+    category: str, actions: list[str], current_category: str = "",
+) -> str:
+    """Repair an unknown VLM label only when its own visible actions are explicit."""
+    if category != "unknown" or not actions:
+        return category
+    text = "；".join(actions).casefold()
+    keyword_groups = (
+        ("phone", ("手机", "移动电话")),
+        ("computer", ("电脑", "屏幕", "键盘", "鼠标", "笔记本电脑")),
+        ("reading", ("阅读", "读书", "翻书", "纸张", "书本")),
+        ("writing", ("手写", "书写", "写字", "记笔记")),
+        ("eating", ("进食", "吃", "饮水", "喝水", "杯子", "餐具")),
+        ("conversation", ("开口说话", "持续说话", "交谈手势")),
+    )
+    for inferred, keywords in keyword_groups:
+        if any(keyword in text for keyword in keywords):
+            return inferred
+    # At a calibrated workstation the monitor itself is often outside the tight
+    # person crop. Seated desk posture and small head/arm adjustments are still
+    # part of computer use unless a visible, incompatible action says otherwise.
+    if not any(keyword in text for keyword in WORKSTATION_COMPUTER_BLOCKERS):
+        if any(keyword in text for keyword in WORKSTATION_COMPUTER_EXPLICIT):
+            return "computer"
+        posture_hits = sum(keyword in text for keyword in WORKSTATION_COMPUTER_POSTURE)
+        if posture_hits >= 2 or (current_category == "computer" and posture_hits >= 1):
+            return "computer"
+    return category
+
+
+def clean_target_description(value: Any, fallback: str = "动作无法确定") -> str:
+    """Sanitize legacy free text before returning it through the activity API."""
+    clauses = [" ".join(str(value or "").split())]
+    for delimiter in ("。", "；", "，", "\n"):
+        clauses = [piece for clause in clauses for piece in clause.split(delimiter)]
+    cleaned = clean_target_actions(clauses)
+    return "；".join(cleaned)[:300] if cleaned else fallback
 
 
 def _ensure_columns(connection: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
@@ -90,6 +170,9 @@ def default_config() -> dict[str, Any]:
         # Continuous motion pipeline. The legacy single-image classifier remains the rollback path.
         "motion_pipeline": {
             "enabled": True,
+            "pose_source": "mediapipe",
+            "mediapipe_pose_model": "/models/mediapipe/pose_landmarker_lite.task",
+            "pose_frame_tolerance_seconds": 1.5,
             "window_seconds": 8,
             "step_seconds": 2,
             "semantic_interval_seconds": 10,
@@ -106,10 +189,20 @@ def default_config() -> dict[str, Any]:
         "identity": {
             "confirmation_samples": 2,
             "cosmos_match_confidence": 0.85,
+            "strong_match_confidence": 0.95,
+            "strong_reid_similarity": 0.80,
+            "known_match_retry_seconds": 0.5,
+            "pending_stale_seconds": 6.0,
+            "pending_limit": 24,
+            "low_quality_retry_seconds": 15.0,
+            "fast_known_match_confidence": 0.95,
+            "fast_known_person_confidence": 0.95,
+            "fast_known_minimum_quality": 0.65,
+            "fast_known_recent_seconds": 1800,
             "candidate_limit": 3,
             "gallery_limit": 5,
             "minimum_image_height": 256,
-            "minimum_detection_confidence": 0.7,
+            "minimum_detection_confidence": 0.3,
             "minimum_visible_keypoints_ratio": 0.8,
             "gallery_diversity_similarity": 0.95,
         },
@@ -130,6 +223,25 @@ def point_in_polygon(point: tuple[float, float], polygon: list[list[float]]) -> 
                 inside = not inside
         previous = current
     return inside
+
+
+def allow_fast_known_match(
+    *,
+    match_confidence: float,
+    verdict_confidence: float,
+    quality: float,
+    in_chair_roi: bool,
+    seconds_since_target_seen: float,
+    identity: dict[str, Any],
+) -> bool:
+    """Allow one-sample binding only for recent, high-quality known identity evidence."""
+    return bool(
+        in_chair_roi
+        and match_confidence >= float(identity.get("fast_known_match_confidence", 0.95))
+        and verdict_confidence >= float(identity.get("fast_known_person_confidence", 0.95))
+        and quality >= float(identity.get("fast_known_minimum_quality", 0.65))
+        and seconds_since_target_seen <= float(identity.get("fast_known_recent_seconds", 1800))
+    )
 
 
 def person_in_chair(frame: dict[str, Any], config: dict[str, Any]) -> tuple[bool, str | None]:
@@ -292,6 +404,12 @@ def initialize_schema(database_file: Path) -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_people_active ON people(active)"
         )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS person_merge_history ("
+            "source_person_id INTEGER PRIMARY KEY, target_person_id INTEGER NOT NULL, "
+            "source_name TEXT NOT NULL, target_name TEXT NOT NULL, "
+            "migrated_json TEXT NOT NULL DEFAULT '{}', merged_at REAL NOT NULL)"
+        )
         # track -> person 映射：同一人跨重进/跨 track 归并到同一 person
         connection.execute(
             "CREATE TABLE IF NOT EXISTS person_track_map ("
@@ -415,12 +533,22 @@ class WorkstationEngine:
         self._person_last_verify_at: dict[str, float] = {}
         # 待判定的新 track 队列（track_id -> bbox），由 worker 主循环异步消费（不阻塞 process_frame）
         self._person_pending: dict[str, dict[str, Any]] = {}
-        # Synchronized RT-CV pose samples are kept in memory only; aggregate windows are persisted.
+        # 已通过一次 VLM 身份确认的 track 优先复核，并只复核上次命中的人物。
+        self._person_match_priority: dict[str, int] = {}
+        # Synchronized per-track pose samples are kept in memory only; aggregate windows are persisted.
         self._motion_samples: dict[str, list[dict[str, Any]]] = {}
         self._motion_last_window_at: dict[str, float] = {}
         self._motion_last_semantic_at: dict[str, float] = {}
         self.frame_buffer: RtspFrameBuffer | None = None
         self.hand_analyzer: MediaPipeHandAnalyzer | None = None
+        self.pose_analyzer: MediaPipePoseAnalyzer | None = None
+        self._motion_last_pose_frame_at: dict[str, float] = {}
+        # The dedicated motion worker may attach a non-blocking Kafka sink. The API
+        # process leaves this unset, so pose collection cannot affect request handling.
+        self.pose_observer: Any | None = None
+        self.pose_observe_hands = True
+        self.pose_observation_interval_seconds = 0.5
+        self._motion_last_observation_at: dict[str, float] = {}
         self.model_id: str | None = None
         self.last_health_check = 0.0
         self.last_health_result = False
@@ -513,7 +641,7 @@ class WorkstationEngine:
         seen: set[str] = set()
         # 新 track 判定参数
         verify_seconds = max(0.0, float(self.workstation.get("person_verify_seconds", 3.0)))
-        pending: list[tuple[str, dict[str, Any]]] = []
+        pending: list[tuple[str, dict[str, Any], bool]] = []
         for item in frame.get("objects", []):
             if str(item.get("type", "")).casefold() != "person":
                 continue
@@ -542,7 +670,8 @@ class WorkstationEngine:
             ).fetchone()
             if mapped:
                 connection.execute("UPDATE people SET last_seen_at = ? WHERE id = ?", (observed, int(mapped[0])))
-            if point_in_polygon(foot, polygon):
+            in_chair_roi = point_in_polygon(foot, polygon)
+            if in_chair_roi:
                 self._observe_person_seated(connection, camera_id, track_id, observed)
             else:
                 self._close_person_seated(connection, track_id, observed)
@@ -557,19 +686,58 @@ class WorkstationEngine:
                 else:
                     self._person_seen_seconds[track_id] = observed - self._person_first_seen[track_id]
                 if self._person_seen_seconds[track_id] >= verify_seconds:
-                    pending.append((track_id, dict(item)))
+                    pending.append((track_id, dict(item), in_chair_roi))
         for track_id in list(self.person_seated):
             if track_id not in seen:
                 self._close_person_seated(connection, track_id, observed)
         self._close_departed_person_activities(connection, seen, observed)
         # 达标的新 track 进入内存待判队列，由 worker 主循环异步消费（VLM 判定不能占用 DB 事务）
-        for track_id, item in pending:
-            self._person_pending.setdefault(track_id, item)
+        for track_id, item, in_chair_roi in pending:
+            previous = self._person_pending.get(track_id, {})
+            item["_identity_in_chair_roi"] = in_chair_roi
+            item["_identity_last_seen_at"] = observed
+            item["_identity_enqueued_at"] = float(previous.get("_identity_enqueued_at", observed))
+            bbox = item.get("bbox") or {}
+            item["_identity_bbox_height"] = max(
+                0.0, float(bbox.get("bottomY", 0)) - float(bbox.get("topY", 0))
+            )
+            # Replace stale screenshots for the same tracker with the newest crop.
+            self._person_pending[track_id] = item
+        identity = self.workstation.get("identity", {})
+        pending_limit = max(1, int(identity.get("pending_limit", 24)))
+        if len(self._person_pending) > pending_limit:
+            ranked = sorted(
+                self._person_pending.items(),
+                key=lambda pair: (
+                    pair[0] in self._person_match_priority,
+                    bool(pair[1].get("_identity_in_chair_roi", False)),
+                    float(pair[1].get("_identity_last_seen_at", 0)),
+                    float(pair[1].get("_identity_bbox_height", 0)),
+                ),
+                reverse=True,
+            )[:pending_limit]
+            self._person_pending = dict(ranked)
 
     def _drain_person_pending(self, now: float | None = None) -> None:
         """worker 主循环调用：每次处理一个待判新 track（VLM 判定耗时，异步执行）。"""
         current = time.time() if now is None else now
+        identity = self.workstation.get("identity", {})
+        stale_seconds = max(1.0, float(identity.get("pending_stale_seconds", 6.0)))
         for track_id, item in list(self._person_pending.items()):
+            if current - float(item.get("_identity_last_seen_at", current)) > stale_seconds:
+                self._person_pending.pop(track_id, None)
+                self._person_match_priority.pop(track_id, None)
+        ranked = sorted(
+            self._person_pending.items(),
+            key=lambda pair: (
+                pair[0] in self._person_match_priority,
+                bool(pair[1].get("_identity_in_chair_roi", False)),
+                float(pair[1].get("_identity_last_seen_at", 0)),
+                float(pair[1].get("_identity_bbox_height", 0)),
+            ),
+            reverse=True,
+        )
+        for track_id, item in ranked:
             cooldown = max(0.0, float(self.workstation.get("person_reject_cooldown_seconds", 600)))
             # 已入库/被拒冷却中的 track 跳过
             with closing(self._connect()) as connection:
@@ -579,9 +747,14 @@ class WorkstationEngine:
                 rejected = current < self._person_reject_until.get(track_id, 0.0)
             if row is not None or rejected:
                 self._person_pending.pop(track_id, None)
+                self._person_match_priority.pop(track_id, None)
                 continue
             verify_seconds = max(0.0, float(self.workstation.get("person_verify_seconds", 3.0)))
-            if current - self._person_last_verify_at.get(track_id, 0.0) < verify_seconds:
+            retry_seconds = (
+                max(0.0, float(identity.get("known_match_retry_seconds", 0.5)))
+                if track_id in self._person_match_priority else verify_seconds
+            )
+            if current - self._person_last_verify_at.get(track_id, 0.0) < retry_seconds:
                 continue
             self._person_last_verify_at[track_id] = current
             self._person_pending.pop(track_id, None)
@@ -598,17 +771,36 @@ class WorkstationEngine:
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(f"[office-api] person verify crop failed track={track_id}: {error}", flush=True)
             return
-        # Step 1: 单图判定是否真人（过滤布偶/海报/显示器人像等误检）
-        try:
-            verdict = self._call_vlm_verdict(image)
-        except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as error:
-            self.last_vlm_error = str(error)
-            print(f"[office-api] person verify VLM failed track={track_id}: {error}", flush=True)
+        quality = self._person_image_quality(image, item)
+        if quality <= 0:
+            identity = self.workstation.get("identity", {})
+            retry_seconds = max(1.0, float(identity.get("low_quality_retry_seconds", 15.0)))
+            with self.lock, closing(self._connect()) as connection, connection:
+                connection.execute(
+                    "INSERT INTO person_verifications("
+                    "track_id, is_person, confidence, reason, decision, quality_score, created_at) "
+                    "VALUES (?, 1, 0, '截图未达到建档质量阈值', 'low_quality', 0, ?)",
+                    (track_id, observed),
+                )
+            # Reject locally before VLM; retry later in case pose or visibility improves.
+            self._person_reject_until[track_id] = observed + retry_seconds
+            self._person_match_priority.pop(track_id, None)
             return
+        preferred_person_id = self._person_match_priority.get(track_id)
+        # A second confirmation for the same live tracker reuses the first human
+        # verdict and spends VLM time only on the previously matched identity.
+        if preferred_person_id is not None:
+            verdict = {"is_person": True, "confidence": 1.0, "reason": "已通过首轮真人验证"}
+        else:
+            try:
+                verdict = self._call_vlm_verdict(image)
+            except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as error:
+                self.last_vlm_error = str(error)
+                print(f"[office-api] person verify VLM failed track={track_id}: {error}", flush=True)
+                return
         is_person = bool(verdict.get("is_person", False))
         verdict_confidence = max(0.0, min(1.0, float(verdict.get("confidence", 0))))
         reason = str(verdict.get("reason", ""))[:200]
-        quality = self._person_image_quality(image, item)
         with self.lock, closing(self._connect()) as connection, connection:
             if not is_person:
                 connection.execute(
@@ -619,20 +811,13 @@ class WorkstationEngine:
                 )
                 # 非真人：冷却期内不再重复判定（布偶/海报类稳定误检）
                 self._person_reject_until[track_id] = observed + reject_cooldown
-                return
-            if quality <= 0:
-                connection.execute(
-                    "INSERT INTO person_verifications("
-                    "track_id, is_person, confidence, reason, decision, quality_score, created_at) "
-                    "VALUES (?, 1, ?, '截图未达到建档质量阈值', 'low_quality', 0, ?)",
-                    (track_id, verdict_confidence, observed),
-                )
+                self._person_match_priority.pop(track_id, None)
                 return
             (
                 matched_person_id, match_confidence, nonmatch_confidence,
                 reid_similarity, candidates, match_reason,
             ) = self._match_person_identity(
-                image, embedding, connection,
+                image, embedding, connection, preferred_person_id=preferred_person_id,
             )
             identity = self.workstation.get("identity", {})
             required = max(2, int(identity.get("confirmation_samples", 2)))
@@ -660,12 +845,29 @@ class WorkstationEngine:
             if decision == "ambiguous":
                 return
             if decision == "match_candidate":
+                self._person_match_priority[track_id] = int(matched_person_id)
                 confirmations = connection.execute(
                     "SELECT COUNT(DISTINCT CAST(created_at AS INTEGER)) FROM person_verifications WHERE track_id = ? "
                     "AND decision = 'match_candidate' AND candidate_person_id = ? AND confidence >= ?",
                     (track_id, matched_person_id, threshold),
                 ).fetchone()[0]
-                if int(confirmations) < required:
+                strong_match = (
+                    match_confidence >= float(identity.get("strong_match_confidence", 0.95))
+                    and reid_similarity >= float(identity.get("strong_reid_similarity", 0.80))
+                )
+                target_seen = connection.execute(
+                    "SELECT last_seen_at FROM people WHERE id = ? AND active = 1",
+                    (matched_person_id,),
+                ).fetchone()
+                fast_known_match = bool(target_seen) and allow_fast_known_match(
+                    match_confidence=match_confidence,
+                    verdict_confidence=verdict_confidence,
+                    quality=quality,
+                    in_chair_roi=bool(item.get("_identity_in_chair_roi", False)),
+                    seconds_since_target_seen=max(0.0, observed - float(target_seen[0])),
+                    identity=identity,
+                )
+                if int(confirmations) < (1 if strong_match or fast_known_match else required):
                     return
                 image_path = self._store_person_image(track_id, image)
                 connection.execute(
@@ -682,9 +884,11 @@ class WorkstationEngine:
                     (image_path, track_id),
                 )
                 self._add_reference_image(connection, int(matched_person_id), image_path, observed, quality, embedding)
-                self._backfill_person(connection, track_id, int(matched_person_id))
+                self._backfill_person(connection, track_id, int(matched_person_id), observed)
+                self._person_match_priority.pop(track_id, None)
                 print(f"[office-api] track {track_id} -> 人员 #{matched_person_id} (匹配), image={image_path}", flush=True)
                 return
+            self._person_match_priority.pop(track_id, None)
             confirmations = connection.execute(
                 "SELECT COUNT(DISTINCT CAST(created_at AS INTEGER)) FROM person_verifications WHERE track_id = ? "
                 "AND decision = 'new_candidate' AND is_person = 1 AND confidence >= ?",
@@ -709,7 +913,7 @@ class WorkstationEngine:
                 (person_id, image_path, track_id),
             )
             self._add_reference_image(connection, person_id, image_path, observed, quality, embedding, is_cover=True)
-            self._backfill_person(connection, track_id, person_id)
+            self._backfill_person(connection, track_id, person_id, observed)
             print(f"[office-api] 新人注册: track {track_id} -> 人员 #{person_id}, image={image_path}", flush=True)
 
     def _next_person_number(self, connection: sqlite3.Connection) -> int:
@@ -733,6 +937,7 @@ class WorkstationEngine:
         image: bytes,
         embedding: list[float],
         connection: sqlite3.Connection,
+        preferred_person_id: int | None = None,
     ) -> tuple[int | None, float, float, float, list[dict[str, Any]], str]:
         """Use RT-CV ReID for top-k recall and Cosmos only for final identity confirmation."""
         identity = self.workstation.get("identity", {})
@@ -759,11 +964,14 @@ class WorkstationEngine:
             similarity = cosine_similarity(embedding, reference_embedding)
             profile["similarity"] = max(float(profile["similarity"]), similarity)
             profile["references"].append((str(row["path"]), float(row["quality_score"])))
-        candidates = sorted(
-            profiles.values(),
-            key=lambda value: (float(value["similarity"]), float(value["last_seen_at"])),
-            reverse=True,
-        )[:limit]
+        if preferred_person_id is not None and preferred_person_id in profiles:
+            candidates = [profiles[preferred_person_id]]
+        else:
+            candidates = sorted(
+                profiles.values(),
+                key=lambda value: (float(value["similarity"]), float(value["last_seen_at"])),
+                reverse=True,
+            )[:limit]
         public_candidates = [
             {"person_id": item["person_id"], "name": item["name"], "reid_similarity": round(item["similarity"], 4)}
             for item in candidates
@@ -826,12 +1034,20 @@ class WorkstationEngine:
             pixels = list(grayscale.getdata())
         mean = sum(pixels) / max(1, len(pixels))
         contrast = min(1.0, (sum((value - mean) ** 2 for value in pixels) / max(1, len(pixels))) ** 0.5 / 64)
+        # DeepStream rtdetr protobuf emits confidence = -0.1 (sentinel) when the
+        # detector does not provide a real confidence. Treat non-positive values as
+        # "no confidence reported" and skip that gate instead of rejecting the
+        # enrollment evidence outright. Real rtdetr person confidences are commonly
+        # in the 0.3-0.6 band, so the gate uses minimum_detection_confidence (0.3)
+        # as a coarse filter; precision is left to the VLM person verdict.
+        valid_confidence = confidence > 0.0
         passed = (
             height >= float(identity.get("minimum_image_height", 256))
-            and confidence >= float(identity.get("minimum_detection_confidence", 0.7))
+            and (not valid_confidence or confidence >= float(identity.get("minimum_detection_confidence", 0.3)))
             and visible >= float(identity.get("minimum_visible_keypoints_ratio", 0.8))
         )
-        return round((0.4 * min(1.0, height / 512) + 0.3 * confidence + 0.2 * visible + 0.1 * contrast) if passed else 0.0, 4)
+        score_confidence = max(0.0, confidence)
+        return round((0.4 * min(1.0, height / 512) + 0.3 * score_confidence + 0.2 * visible + 0.1 * contrast) if passed else 0.0, 4)
 
     def _add_reference_image(
         self,
@@ -882,14 +1098,21 @@ class WorkstationEngine:
             connection.execute("UPDATE people SET reference_image = ? WHERE id = ?", (str(cover[0]), person_id))
 
     @staticmethod
-    def _backfill_person(connection: sqlite3.Connection, track_id: str, person_id: int) -> None:
+    def _backfill_person(
+        connection: sqlite3.Connection, track_id: str, person_id: int, observed: float,
+    ) -> None:
+        """Backfill only this track lifecycle; tracker IDs can be reused after a restart."""
+        lifecycle_start = observed - 600
+        lifecycle_end = observed + 60
         connection.execute(
-            "UPDATE person_activity_intervals SET person_id = ? WHERE track_id = ? AND person_id IS NULL",
-            (person_id, track_id),
+            "UPDATE person_activity_intervals SET person_id = ? WHERE track_id = ? AND person_id IS NULL "
+            "AND COALESCE(last_observed_at, started_at) >= ? AND started_at <= ?",
+            (person_id, track_id, lifecycle_start, lifecycle_end),
         )
         connection.execute(
-            "UPDATE person_motion_windows SET person_id = ? WHERE track_id = ? AND person_id IS NULL",
-            (person_id, track_id),
+            "UPDATE person_motion_windows SET person_id = ? WHERE track_id = ? AND person_id IS NULL "
+            "AND ended_at >= ? AND started_at <= ?",
+            (person_id, track_id, lifecycle_start, lifecycle_end),
         )
 
     def _call_vlm_verdict(self, image: bytes) -> dict[str, Any]:
@@ -1061,7 +1284,13 @@ class WorkstationEngine:
             current, pending, count = "unknown", "", 0
             current_description, pending_description, pending_started_at = "", "", None
 
-        valid = confidence >= minimum_conf and activity != "unknown"
+        # An unknown category can still carry useful, directly observed motion.
+        # Keep those windows in the timeline; discard only genuinely empty evidence.
+        meaningful_unknown = (
+            activity == "unknown"
+            and description not in {"动作无法确定", ACTIVITY_LABELS["unknown"]}
+        )
+        valid = confidence >= minimum_conf and (activity != "unknown" or meaningful_unknown)
         same_event = bool(
             valid
             and open_event
@@ -1153,9 +1382,14 @@ class WorkstationEngine:
         if self.hand_analyzer is None:
             model_path = str(self.workstation.get("motion_pipeline", {}).get("mediapipe_hand_model", ""))
             self.hand_analyzer = MediaPipeHandAnalyzer(model_path)
+        if self.pose_analyzer is None:
+            model_path = str(self.workstation.get("motion_pipeline", {}).get("mediapipe_pose_model", ""))
+            self.pose_analyzer = MediaPipePoseAnalyzer(model_path)
 
-    def process_motion_frame(self, frame: dict[str, Any], now: float | None = None) -> int:
-        """Ingest synchronized RT-CV bbox/ReID/pose metadata and persist due motion windows."""
+    def process_motion_frame(
+        self, frame: dict[str, Any], now: float | None = None, observation_only: bool = False,
+    ) -> int:
+        """Combine RT-CV bbox/ReID with MediaPipe pose and persist due motion windows."""
         if not self.workstation.get("motion_pipeline", {}).get("enabled", True):
             return 0
         current = time.time() if now is None else now
@@ -1164,13 +1398,14 @@ class WorkstationEngine:
         except (TypeError, ValueError):
             observed = current
         token = f"{frame.get('sensorId', '')}:{frame.get('id', '')}:{frame.get('timestamp', '')}"
-        with self.lock, closing(self._connect()) as connection, connection:
-            try:
-                connection.execute("INSERT INTO motion_frame_tokens(token, observed_at) VALUES (?, ?)", (token, observed))
-            except sqlite3.IntegrityError:
-                return 0
-            self._set_state(connection, "motion_worker_last_seen", current)
-            self._set_state(connection, "motion_worker_last_frame_at", observed)
+        if not observation_only:
+            with self.lock, closing(self._connect()) as connection, connection:
+                try:
+                    connection.execute("INSERT INTO motion_frame_tokens(token, observed_at) VALUES (?, ?)", (token, observed))
+                except sqlite3.IntegrityError:
+                    return 0
+                self._set_state(connection, "motion_worker_last_seen", current)
+                self._set_state(connection, "motion_worker_last_frame_at", observed)
         motion_config = self.workstation.get("motion_pipeline", {})
         window_seconds = max(4.0, float(motion_config.get("window_seconds", 8)))
         step_seconds = max(1.0, float(motion_config.get("step_seconds", 2)))
@@ -1184,23 +1419,81 @@ class WorkstationEngine:
                 self._motion_samples.pop(stale_track, None)
                 self._motion_last_window_at.pop(stale_track, None)
                 self._motion_last_semantic_at.pop(stale_track, None)
+                self._motion_last_pose_frame_at.pop(stale_track, None)
+                self._motion_last_observation_at.pop(stale_track, None)
         created = 0
         for item in frame.get("objects", []):
             if str(item.get("type", "")).casefold() != "person":
                 continue
             track_id = str(item.get("id", "")).strip()
-            pose = parse_pose(item)
-            pose = {name: point for name, point in pose.items() if point.confidence >= minimum_pose}
             bbox = item.get("bbox") or {}
+            pose_source = str(motion_config.get("pose_source", "mediapipe")).casefold()
+            pose: dict[str, Any] = {}
+            pose_frame_stamp = observed
+            image_data: bytes | None = None
+            if pose_source in {"mediapipe", "auto"} and self.pose_analyzer is not None and self.frame_buffer is not None:
+                tolerance = max(0.1, float(motion_config.get("pose_frame_tolerance_seconds", 1.5)))
+                buffered = self.frame_buffer.nearest(observed, tolerance)
+                if buffered is not None:
+                    pose_frame_stamp, image_data = buffered
+                    if pose_frame_stamp > self._motion_last_pose_frame_at.get(track_id, 0):
+                        self._motion_last_pose_frame_at[track_id] = pose_frame_stamp
+                        pose = self.pose_analyzer.analyze(image_data, bbox, minimum_pose)
+            if not pose and pose_source in {"rtcv", "auto"}:
+                pose = parse_pose(item)
+                pose = {name: point for name, point in pose.items() if point.confidence >= minimum_pose}
             if not track_id or not pose or not bbox:
                 continue
-            samples = self._motion_samples.setdefault(track_id, [])
-            samples.append({
-                "timestamp": observed,
+            sample = {
+                "timestamp": pose_frame_stamp,
                 "pose": pose,
                 "bbox": dict(bbox),
                 "embedding": extract_embedding(item),
-            })
+                "pose_source": pose_source,
+            }
+            samples = [sample] if observation_only else self._motion_samples.setdefault(track_id, [])
+            if not observation_only:
+                samples.append(sample)
+            observation_interval = max(0.1, float(self.pose_observation_interval_seconds))
+            observation_due = (
+                self.pose_observer is not None
+                and image_data is not None
+                and pose_source in {"mediapipe", "auto"}
+                and pose_frame_stamp - self._motion_last_observation_at.get(track_id, 0) >= observation_interval
+            )
+            if observation_due:
+                self._motion_last_observation_at[track_id] = pose_frame_stamp
+                hand_facts: dict[str, Any] | None = None
+                try:
+                    if self.pose_observe_hands and self.hand_analyzer is not None:
+                        person_frames = crop_person_frames(
+                            [(pose_frame_stamp, image_data)], [samples[-1]],
+                        )
+                        hand_facts = self.hand_analyzer.analyze(person_frames)
+                    with closing(self._connect()) as mapping_connection:
+                        mapping = mapping_connection.execute(
+                            "SELECT person_id FROM person_track_map WHERE track_id = ?", (track_id,),
+                        ).fetchone()
+                    person_id = int(mapping[0]) if mapping else None
+                    observation = build_pose_observation(
+                        sensor_id=camera_id,
+                        frame_id=str(frame.get("id", "")),
+                        track_id=track_id,
+                        timestamp=pose_frame_stamp,
+                        source_timestamp=observed,
+                        bbox=bbox,
+                        pose=pose,
+                        frame_width=width,
+                        frame_height=height,
+                        person_id=person_id,
+                        hands=hand_facts,
+                    )
+                    self.pose_observer(observation)
+                except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as error:
+                    print(f"[office-motion-worker] pose observation skipped track={track_id}: {error}", flush=True)
+            if observation_only:
+                created += int(observation_due)
+                continue
             cutoff = observed - window_seconds
             samples[:] = [sample for sample in samples if sample["timestamp"] >= cutoff]
             if len(samples) < 2 or observed - self._motion_last_window_at.get(track_id, 0) < step_seconds:
@@ -1334,11 +1627,26 @@ class WorkstationEngine:
             category = str(result.get("category", result.get("activity", "unknown"))).lower()
             if category not in ACTIVITIES:
                 category = "unknown"
-            description = " ".join(str(result.get("description", "")).split())[:300]
             confidence = max(0.0, min(1.0, float(result.get("confidence", 0))))
             continues = result.get("continues_current") is True
-            observed_actions = result.get("observed_actions", [])
+            observed_actions = clean_target_actions(result.get("observed_actions", []))
+            with self.lock, closing(self._connect()) as context_connection:
+                current_event = self._current_person_event(context_connection, str(row["track_id"]))
+            current_category = str(current_event["activity"]) if current_event else ""
+            category = infer_activity_from_actions(category, observed_actions, current_category)
             uncertainty = str(result.get("uncertainty", ""))[:300]
+            if category == "rest" and result.get("sleep_evidence") is not True:
+                category = "unknown"
+                confidence = min(confidence, 0.59)
+                continues = False
+                uncertainty = (uncertainty + "；未观察到持续闭眼或打盹证据").strip("；")[:300]
+            if not observed_actions:
+                category = "unknown"
+                confidence = min(confidence, 0.59)
+                continues = False
+                description = "动作无法确定"
+            else:
+                description = "；".join(observed_actions)[:300]
             with self.lock, closing(self._connect()) as connection, connection:
                 interval_id = self._record_person_activity(
                     connection, str(row["camera_id"]), str(row["track_id"]), category,
@@ -1399,18 +1707,26 @@ class WorkstationEngine:
             "current_event": context,
         }
         prompt = (
-            "你将收到同一人员连续时间窗的结构化运动测量、人物近景故事板和环境故事板。"
+            "你将收到同一目标人物连续时间窗的结构化运动测量和人物近景故事板。"
             "测量是证据，不是活动标签；z只表示单目模型估计的相对前后变化。"
-            "先描述可观察的动作，再结合环境判断活动。禁止猜测屏幕内容、文件名、谈话主题、业务目的、身份或敏感属性。"
-            "证据不足时明确写无法判断。description必须是自然、自由且简短的中文，不要使用固定模板。"
+            "只分析裁剪框中的目标人物；忽略并且绝不描述背景、场所、光线、服装、外貌、身份、其他人物或人与人的关系。"
+            "observed_actions必须列出1到4个只属于目标人物的可见动作短语，不要写人物外貌或环境；"
+            "description只能由这些动作组成，禁止猜测屏幕内容、文件名、谈话主题、业务目的或敏感属性。"
+            "computer仅在可见看屏幕、使用键鼠或打字时选择；reading仅限阅读纸张或书；writing仅限手写；"
+            "phone仅限可见使用手机；conversation仅在目标人物持续开口说话或有明确交谈手势时选择，且不得描述对方；"
+            "eating仅限进食或饮水。rest仅表示睡眠：必须在多个画面持续闭眼，并伴随打盹姿态且没有目的性动作。"
+            "在已标定的电脑工位内，人物保持坐姿面向桌面或屏幕、低头观看、身体前倾，或只有头部、上半身、"
+            "手臂和手部的小幅调整，均视为连续使用电脑；紧裁剪画面未拍到显示器本身不能作为unknown的理由。"
+            "静坐、发呆、托腮、思考、等待、身体稳定、低头或后仰都不能单独判为rest；动作不明确时用unknown。"
+            "sleep_evidence只有满足上述睡眠证据时才可为true。"
             "只返回JSON："
             '{"category":"computer|reading|writing|phone|conversation|eating|rest|unknown",'
             '"description":"自由中文描述","observed_actions":["可见动作"],'
-            '"continues_current":true,"confidence":0.0,"uncertainty":"不确定原因"}\n'
+            '"sleep_evidence":false,"continues_current":true,"confidence":0.0,"uncertainty":"不确定原因"}\n'
             f"运动证据：{json.dumps(evidence, ensure_ascii=False)}"
         )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-        for key in ("person_storyboard", "scene_storyboard"):
+        for key in ("person_storyboard",):
             relative = str(window.get(key, ""))
             path = self.database_file.parent / relative
             if relative and path.is_file():
@@ -2232,6 +2548,201 @@ class WorkstationEngine:
 
     # ---- 每日活动日志与人员库查询（供 API/前端/Agent 使用） ----
 
+    def _person_lifecycle_events(
+        self,
+        connection: sqlite3.Connection,
+        start: float,
+        end: float,
+        effective_now: float,
+        person_id: int | None = None,
+        needle: str = "",
+    ) -> list[dict[str, Any]]:
+        """Derive evidence-backed leave/return events from recognized seated tracks."""
+        camera_id = str(self.config["camera"].get("id", "office-main"))
+        merge_gap = max(60.0, float(self.workstation.get("person_presence_merge_seconds", 300)))
+        rows = connection.execute(
+            "SELECT s.*, m.person_id AS resolved_person_id, p.name AS person_name, p.active AS person_active "
+            "FROM person_seated_intervals s "
+            "JOIN person_track_map m ON m.track_id = s.track_id "
+            "JOIN people p ON p.id = m.person_id "
+            "WHERE s.camera_id = ? AND s.started_at < ? "
+            "AND COALESCE(s.ended_at, s.last_seen_at) > ? AND p.active = 1 "
+            "ORDER BY m.person_id, s.started_at, s.id",
+            (camera_id, end, start - merge_gap),
+        ).fetchall()
+
+        grouped: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            resolved = int(row["resolved_person_id"])
+            if person_id is not None and resolved != person_id:
+                continue
+            item = grouped.setdefault(resolved, {
+                "person_name": str(row["person_name"]),
+                "intervals": [],
+            })
+            interval_end = float(row["ended_at"] or row["last_seen_at"] or row["started_at"])
+            if interval_end <= float(row["started_at"]):
+                continue
+            item["intervals"].append({
+                "ids": {int(row["id"])},
+                "started_at": float(row["started_at"]),
+                "ended_at": interval_end,
+                "tracks": {str(row["track_id"])},
+            })
+
+        def evidence_for(tracks: set[str], boundary: float, kind: str) -> sqlite3.Row | None:
+            if not tracks:
+                return None
+            placeholders = ",".join("?" for _ in tracks)
+            if kind == "leave":
+                lower, upper = boundary - 45, boundary + 120
+                preferred = (
+                    "CASE WHEN o.description LIKE '%离开%' OR o.description LIKE '%消失%' "
+                    "OR w.motion_summary LIKE '%stood_up%' OR w.motion_summary LIKE '%moved_away%' "
+                    "THEN 0 ELSE 1 END"
+                )
+            else:
+                lower, upper = boundary, boundary + 300
+                preferred = "CASE WHEN w.person_storyboard != '' THEN 0 ELSE 1 END"
+            return connection.execute(
+                "SELECT w.*, o.id AS observation_id, o.description AS observation_description, "
+                "o.observed_actions_json, o.confidence AS observation_confidence, o.uncertainty "
+                "FROM person_motion_windows w "
+                "LEFT JOIN person_activity_observations o ON o.motion_window_id = w.id "
+                f"WHERE w.track_id IN ({placeholders}) AND w.started_at >= ? AND w.started_at <= ? "
+                f"ORDER BY {preferred}, CASE WHEN w.person_storyboard != '' THEN 0 ELSE 1 END, "
+                "ABS(w.started_at - ?) LIMIT 1",
+                (*sorted(tracks), lower, upper, boundary),
+            ).fetchone()
+
+        events: list[dict[str, Any]] = []
+        for resolved, item in grouped.items():
+            merged_presence: list[dict[str, Any]] = []
+            for interval in item["intervals"]:
+                if merged_presence and interval["started_at"] <= merged_presence[-1]["ended_at"] + merge_gap:
+                    merged_presence[-1]["ended_at"] = max(
+                        merged_presence[-1]["ended_at"], interval["ended_at"],
+                    )
+                    merged_presence[-1]["ids"].update(interval["ids"])
+                    merged_presence[-1]["tracks"].update(interval["tracks"])
+                else:
+                    merged_presence.append(interval)
+
+            for index, interval in enumerate(merged_presence):
+                following = merged_presence[index + 1] if index + 1 < len(merged_presence) else None
+                away_end = following["started_at"] if following else effective_now
+                if away_end - interval["ended_at"] <= merge_gap:
+                    continue
+                leave_evidence = evidence_for(interval["tracks"], interval["ended_at"], "leave")
+                leave_text = "" if not leave_evidence else " ".join((
+                    str(leave_evidence["observation_description"] or ""),
+                    str(leave_evidence["motion_summary"] or ""),
+                )).casefold()
+                explicit_leave = any(marker in leave_text for marker in (
+                    "离开座位", "离开工位", "从画面中完全消失", "走出画面",
+                    "站起并离开", "起身并离开", "stood_up_or_approached_camera",
+                ))
+                published_leave = False
+                if interval["ended_at"] < end and away_end > start:
+                    description = "离开座位并离开工位"
+                    searchable = " ".join((item["person_name"], "离开工位", description)).casefold()
+                    if not needle or needle in searchable:
+                        window_id = int(leave_evidence["id"]) if leave_evidence else None
+                        seated_id = max(interval["ids"])
+                        event_id = (
+                            -(window_id * 2)
+                            if leave_evidence and explicit_leave
+                            else -(PRESENCE_LIFECYCLE_ID_BASE + seated_id * 2)
+                        )
+                        event_start = max(start, interval["ended_at"])
+                        event_end = min(end, away_end)
+                        events.append({
+                            "id": event_id,
+                            "person_id": resolved,
+                            "person_name": item["person_name"],
+                            "track_id": (
+                                str(leave_evidence["track_id"])
+                                if leave_evidence else sorted(interval["tracks"])[-1]
+                            ),
+                            "activity": "left_workstation",
+                            "activity_label": ACTIVITY_LABELS["left_workstation"],
+                            "description": description,
+                            "started_at": event_start,
+                            "ended_at": event_end,
+                            "duration_seconds": round(event_end - event_start),
+                            "ongoing": following is None,
+                            "confidence": round(float(
+                                leave_evidence["observation_confidence"]
+                                or leave_evidence["quality"] or 1
+                            ), 3) if leave_evidence and explicit_leave else 1.0,
+                            "observation_count": 1,
+                            "source_ids": [],
+                            "motion_summary": (
+                                str(leave_evidence["motion_summary"] or "")
+                                if leave_evidence and explicit_leave
+                                else "识别人员离开座椅区域并持续缺席"
+                            ),
+                            "evidence_status": (
+                                str(leave_evidence["status"] or "unavailable")
+                                if leave_evidence and explicit_leave else "presence_timeout"
+                            ),
+                            "storyboard_url": (
+                                f"/api/activity/evidence/{window_id}/person"
+                                if leave_evidence and explicit_leave and leave_evidence["person_storyboard"] else ""
+                            ),
+                        })
+                        published_leave = True
+                if not following or not published_leave:
+                    continue
+                return_evidence = evidence_for(following["tracks"], following["started_at"], "return")
+                if start <= following["started_at"] < end:
+                    description = "返回工位并重新坐下"
+                    searchable = " ".join((item["person_name"], "返回工位", description)).casefold()
+                    if not needle or needle in searchable:
+                        window_id = int(return_evidence["id"]) if return_evidence else None
+                        seated_id = min(following["ids"])
+                        event_id = (
+                            -(window_id * 2 + 1)
+                            if return_evidence
+                            else -(PRESENCE_LIFECYCLE_ID_BASE + seated_id * 2 + 1)
+                        )
+                        event_start = following["started_at"]
+                        events.append({
+                            "id": event_id,
+                            "person_id": resolved,
+                            "person_name": item["person_name"],
+                            "track_id": (
+                                str(return_evidence["track_id"])
+                                if return_evidence else sorted(following["tracks"])[0]
+                            ),
+                            "activity": "returned_to_workstation",
+                            "activity_label": ACTIVITY_LABELS["returned_to_workstation"],
+                            "description": description,
+                            "started_at": event_start,
+                            "ended_at": min(end, event_start + 1),
+                            "duration_seconds": 1,
+                            "ongoing": False,
+                            "confidence": round(float(
+                                return_evidence["observation_confidence"]
+                                or return_evidence["quality"] or 1
+                            ), 3) if return_evidence else 1.0,
+                            "observation_count": 1,
+                            "source_ids": [],
+                            "motion_summary": (
+                                str(return_evidence["motion_summary"] or "")
+                                if return_evidence else "识别人员重新进入座椅区域"
+                            ),
+                            "evidence_status": (
+                                str(return_evidence["status"] or "unavailable")
+                                if return_evidence else "presence_confirmed"
+                            ),
+                            "storyboard_url": (
+                                f"/api/activity/evidence/{window_id}/person"
+                                if return_evidence and return_evidence["person_storyboard"] else ""
+                            ),
+                        })
+        return events
+
     def activity_events(
         self,
         start: float,
@@ -2245,9 +2756,11 @@ class WorkstationEngine:
         effective_now = min(current, end)
         timezone = ZoneInfo(self.config["timezone"])
         camera_id = str(self.config["camera"].get("id", "office-main"))
+        needle = " ".join(query.strip().casefold().split())
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT a.*, COALESCE(a.person_id, m.person_id) AS resolved_person_id, p.name AS person_name "
+                "SELECT a.*, COALESCE(a.person_id, m.person_id) AS resolved_person_id, "
+                "p.name AS person_name, p.active AS person_active "
                 "FROM person_activity_intervals a "
                 "LEFT JOIN person_track_map m ON m.track_id = a.track_id "
                 "LEFT JOIN people p ON p.id = COALESCE(a.person_id, m.person_id) "
@@ -2256,15 +2769,27 @@ class WorkstationEngine:
                 "ORDER BY a.started_at, a.id",
                 (camera_id, end, effective_now, start),
             ).fetchall()
+            lifecycle_events = self._person_lifecycle_events(
+                connection, start, end, effective_now, person_id=person_id, needle=needle,
+            )
 
-        needle = " ".join(query.strip().casefold().split())
         events: list[dict[str, Any]] = []
         for row in rows:
             resolved_person_id = int(row["resolved_person_id"]) if row["resolved_person_id"] is not None else None
+            # Track IDs are short-lived implementation details. Publish an event only
+            # after identity resolution has attached it to an active library person.
+            if resolved_person_id is None or row["person_name"] is None or int(row["person_active"] or 0) != 1:
+                continue
             if person_id is not None and resolved_person_id != person_id:
                 continue
-            activity = str(row["activity"])
-            description = str(row["description"] or ACTIVITY_LABELS.get(activity, activity))
+            raw_activity = str(row["activity"])
+            description = clean_target_description(
+                row["description"], ACTIVITY_LABELS.get(raw_activity, raw_activity),
+            )
+            # Apply the current workstation semantics while reading historical
+            # rows as well, so existing desk-posture fragments immediately join
+            # their surrounding computer-use segment without rewriting evidence.
+            activity = infer_activity_from_actions(raw_activity, [description])
             person_name = str(row["person_name"] or f"人员 {resolved_person_id or row['track_id']}")
             searchable = " ".join((person_name, activity, ACTIVITY_LABELS.get(activity, ""), description)).casefold()
             if needle and needle not in searchable:
@@ -2343,6 +2868,9 @@ class WorkstationEngine:
                     if observation and observation["person_storyboard"] else ""
                 )
 
+        merged.extend(lifecycle_events)
+        merged.sort(key=lambda item: (item["started_at"], item["id"]))
+
         summaries: dict[str, dict[str, Any]] = {}
         for event in merged:
             key = str(event["person_id"]) if event["person_id"] is not None else f"track:{event['track_id']}"
@@ -2368,8 +2896,127 @@ class WorkstationEngine:
             "total_seconds": sum(int(item["duration_seconds"]) for item in merged),
         }
 
+    def _lifecycle_event_detail(self, event_id: int) -> dict[str, Any] | None:
+        encoded = abs(event_id)
+        kind = "returned_to_workstation" if encoded % 2 else "left_workstation"
+        if encoded >= PRESENCE_LIFECYCLE_ID_BASE:
+            seated_id = (encoded - PRESENCE_LIFECYCLE_ID_BASE) // 2
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT s.*, m.person_id AS resolved_person_id, p.name AS person_name "
+                    "FROM person_seated_intervals s "
+                    "JOIN person_track_map m ON m.track_id = s.track_id "
+                    "JOIN people p ON p.id = m.person_id WHERE s.id = ?",
+                    (seated_id,),
+                ).fetchone()
+            if not row:
+                return None
+            boundary = float(
+                row["started_at"] if kind == "returned_to_workstation"
+                else row["ended_at"] or row["last_seen_at"]
+            )
+            description = (
+                "离开座位并离开工位" if kind == "left_workstation" else "返回工位并重新坐下"
+            )
+            evidence_status = (
+                "presence_timeout" if kind == "left_workstation" else "presence_confirmed"
+            )
+            motion_summary = (
+                "识别人员离开座椅区域并持续缺席"
+                if kind == "left_workstation" else "识别人员重新进入座椅区域"
+            )
+            return {
+                "id": event_id,
+                "person_id": int(row["resolved_person_id"]),
+                "person_name": str(row["person_name"]),
+                "track_id": str(row["track_id"]),
+                "category": kind,
+                "description": description,
+                "started_at": boundary,
+                "ended_at": boundary + 1,
+                "observations": [{
+                    "id": 0,
+                    "window_id": 0,
+                    "window": {"start": boundary, "end": boundary + 1},
+                    "category": kind,
+                    "description": description,
+                    "observed_actions": [motion_summary],
+                    "continues_current": False,
+                    "confidence": 1.0,
+                    "uncertainty": "",
+                    "motion_summary": motion_summary,
+                    "motion_facts": {
+                        "presence": {
+                            "seated_interval_id": seated_id,
+                            "started_at": float(row["started_at"]),
+                            "last_seen_at": float(row["last_seen_at"]),
+                            "ended_at": float(row["ended_at"] or row["last_seen_at"]),
+                        },
+                    },
+                    "hand_motion": {},
+                    "evidence_status": evidence_status,
+                    "storyboards": {"person": "", "scene": ""},
+                }],
+            }
+        window_id = encoded // 2
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT w.*, o.id AS observation_id, o.description AS observation_description, "
+                "o.observed_actions_json, o.continues_current, o.confidence AS observation_confidence, "
+                "o.uncertainty, COALESCE(w.person_id, m.person_id) AS resolved_person_id, "
+                "p.name AS person_name FROM person_motion_windows w "
+                "LEFT JOIN person_activity_observations o ON o.motion_window_id = w.id "
+                "LEFT JOIN person_track_map m ON m.track_id = w.track_id "
+                "LEFT JOIN people p ON p.id = COALESCE(w.person_id, m.person_id) "
+                "WHERE w.id = ?",
+                (window_id,),
+            ).fetchone()
+        if not row or row["resolved_person_id"] is None or row["person_name"] is None:
+            return None
+        description = (
+            "离开座位并离开工位" if kind == "left_workstation" else "返回工位并重新坐下"
+        )
+        observed_description = clean_target_description(
+            row["observation_description"] or row["motion_summary"], description,
+        )
+        try:
+            observed_actions = clean_target_actions(json.loads(str(row["observed_actions_json"] or "[]")))
+        except json.JSONDecodeError:
+            observed_actions = []
+        return {
+            "id": event_id,
+            "person_id": int(row["resolved_person_id"]),
+            "person_name": str(row["person_name"]),
+            "track_id": str(row["track_id"]),
+            "category": kind,
+            "description": description,
+            "started_at": float(row["started_at"]),
+            "ended_at": float(row["ended_at"]),
+            "observations": [{
+                "id": int(row["observation_id"] or 0),
+                "window_id": window_id,
+                "window": {"start": float(row["started_at"]), "end": float(row["ended_at"])},
+                "category": kind,
+                "description": observed_description,
+                "observed_actions": observed_actions,
+                "continues_current": bool(row["continues_current"] or False),
+                "confidence": float(row["observation_confidence"] or row["quality"] or 1),
+                "uncertainty": str(row["uncertainty"] or ""),
+                "motion_summary": str(row["motion_summary"] or ""),
+                "motion_facts": json.loads(str(row["facts_json"] or "{}")),
+                "hand_motion": json.loads(str(row["hand_json"] or "{}")),
+                "evidence_status": str(row["status"] or "unavailable"),
+                "storyboards": {
+                    "person": f"/api/activity/evidence/{window_id}/person" if row["person_storyboard"] else "",
+                    "scene": "",
+                },
+            }],
+        }
+
     def activity_event_detail(self, event_id: int) -> dict[str, Any] | None:
         """Return the observation trail and measurable evidence for one raw activity interval."""
+        if event_id < 0:
+            return self._lifecycle_event_detail(event_id)
         with closing(self._connect()) as connection:
             event = connection.execute(
                 "SELECT a.*, COALESCE(a.person_id, m.person_id) AS resolved_person_id, p.name AS person_name "
@@ -2394,7 +3041,9 @@ class WorkstationEngine:
             "person_name": str(event["person_name"] or f"人员 {event['track_id']}"),
             "track_id": str(event["track_id"]),
             "category": str(event["activity"]),
-            "description": str(event["description"] or ACTIVITY_LABELS.get(str(event["activity"]), "")),
+            "description": clean_target_description(
+                event["description"], ACTIVITY_LABELS.get(str(event["activity"]), ""),
+            ),
             "started_at": float(event["started_at"]),
             "ended_at": float(event["ended_at"] or event["last_observed_at"] or event["started_at"]),
             "observations": [{
@@ -2402,8 +3051,10 @@ class WorkstationEngine:
                 "window_id": int(row["window_id"]),
                 "window": {"start": float(row["window_started_at"]), "end": float(row["window_ended_at"])},
                 "category": str(row["category"]),
-                "description": str(row["description"]),
-                "observed_actions": json.loads(str(row["observed_actions_json"] or "[]")),
+                "description": clean_target_description(row["description"]),
+                "observed_actions": clean_target_actions(
+                    json.loads(str(row["observed_actions_json"] or "[]")),
+                ),
                 "continues_current": bool(row["continues_current"]),
                 "confidence": float(row["confidence"]),
                 "uncertainty": str(row["uncertainty"]),
@@ -2413,7 +3064,7 @@ class WorkstationEngine:
                 "evidence_status": str(row["evidence_status"]),
                 "storyboards": {
                     "person": f"/api/activity/evidence/{int(row['window_id'])}/person" if row["person_storyboard"] else "",
-                    "scene": f"/api/activity/evidence/{int(row['window_id'])}/scene" if row["scene_storyboard"] else "",
+                    "scene": "",
                 },
             } for row in observations],
         }
@@ -2525,6 +3176,131 @@ class WorkstationEngine:
                 "UPDATE person_reference_images SET active = 0, is_cover = 0 WHERE person_id = ?", (person_id,)
             )
         return True
+
+    def merge_person(self, source_person_id: int, target_person_id: int) -> dict[str, Any] | None:
+        """Merge a duplicate library person into the retained target person."""
+        if source_person_id == target_person_id:
+            raise ValueError("source and target person must be different")
+        with self.lock, closing(self._connect()) as connection, connection:
+            previous = connection.execute(
+                "SELECT * FROM person_merge_history WHERE source_person_id = ?",
+                (source_person_id,),
+            ).fetchone()
+            if previous:
+                previous_target = int(previous["target_person_id"])
+                if previous_target != target_person_id:
+                    raise ValueError(
+                        f"source person was already merged into person {previous_target}"
+                    )
+                try:
+                    previous_counts = json.loads(str(previous["migrated_json"] or "{}"))
+                except json.JSONDecodeError:
+                    previous_counts = {}
+                return {
+                    "source_person_id": source_person_id,
+                    "target_person_id": target_person_id,
+                    "source_name": str(previous["source_name"]),
+                    "target_name": str(previous["target_name"]),
+                    "migrated": previous_counts,
+                    "already_merged": True,
+                }
+            source = connection.execute(
+                "SELECT * FROM people WHERE id = ? AND active = 1", (source_person_id,)
+            ).fetchone()
+            target = connection.execute(
+                "SELECT * FROM people WHERE id = ? AND active = 1", (target_person_id,)
+            ).fetchone()
+            if not source or not target:
+                return None
+            target_cover = connection.execute(
+                "SELECT id, path FROM person_reference_images "
+                "WHERE person_id = ? AND active = 1 AND is_cover = 1 "
+                "ORDER BY quality_score DESC, captured_at DESC LIMIT 1",
+                (target_person_id,),
+            ).fetchone()
+
+            counts: dict[str, int] = {}
+
+            def migrate(table: str, column: str = "person_id") -> None:
+                cursor = connection.execute(
+                    f"UPDATE {table} SET {column} = ? WHERE {column} = ?",
+                    (target_person_id, source_person_id),
+                )
+                counts[f"{table}.{column}"] = max(0, int(cursor.rowcount))
+
+            migrate("person_track_map")
+            migrate("person_activity_intervals")
+            migrate("person_motion_windows")
+            migrate("person_reference_images")
+            migrate("person_verifications")
+            migrate("person_verifications", "matched_person_id")
+            migrate("person_verifications", "candidate_person_id")
+            flywheel_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'flywheel_candidates'"
+            ).fetchone()
+            if flywheel_exists:
+                migrate("flywheel_candidates")
+
+            connection.execute(
+                "UPDATE people SET first_seen_at = MIN(first_seen_at, ?), "
+                "last_seen_at = MAX(last_seen_at, ?) WHERE id = ?",
+                (float(source["first_seen_at"]), float(source["last_seen_at"]), target_person_id),
+            )
+            connection.execute("UPDATE people SET active = 0 WHERE id = ?", (source_person_id,))
+
+            cover = target_cover
+            if not cover:
+                cover = connection.execute(
+                    "SELECT id, path FROM person_reference_images "
+                    "WHERE person_id = ? AND active = 1 "
+                    "ORDER BY quality_score DESC, captured_at DESC LIMIT 1",
+                    (target_person_id,),
+                ).fetchone()
+            connection.execute(
+                "UPDATE person_reference_images SET is_cover = 0 WHERE person_id = ?",
+                (target_person_id,),
+            )
+            if cover:
+                connection.execute(
+                    "UPDATE person_reference_images SET is_cover = 1 WHERE id = ?", (int(cover["id"]),)
+                )
+                connection.execute(
+                    "UPDATE people SET reference_image = ? WHERE id = ?",
+                    (str(cover["path"]), target_person_id),
+                )
+            gallery_limit = max(1, int(self.workstation.get("identity", {}).get("gallery_limit", 5)))
+            gallery = connection.execute(
+                "SELECT id FROM person_reference_images WHERE person_id = ? AND active = 1 "
+                "ORDER BY is_cover DESC, quality_score DESC, captured_at DESC",
+                (target_person_id,),
+            ).fetchall()
+            for row in gallery[gallery_limit:]:
+                connection.execute(
+                    "UPDATE person_reference_images SET active = 0, is_cover = 0 WHERE id = ?",
+                    (int(row["id"]),),
+                )
+            connection.execute(
+                "INSERT INTO person_merge_history("
+                "source_person_id, target_person_id, source_name, target_name, migrated_json, merged_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    source_person_id,
+                    target_person_id,
+                    str(source["name"]),
+                    str(target["name"]),
+                    json.dumps(counts, ensure_ascii=False),
+                    time.time(),
+                ),
+            )
+
+        return {
+            "source_person_id": source_person_id,
+            "target_person_id": target_person_id,
+            "source_name": str(source["name"]),
+            "target_name": str(target["name"]),
+            "migrated": counts,
+            "already_merged": False,
+        }
 
     def rename_person(self, person_id: int, name: str) -> bool:
         name = str(name).strip()[:50]

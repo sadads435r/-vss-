@@ -30,6 +30,16 @@ BODYPOSE34_NAMES = (
     "right_thumb", "head_top", "spine",
 )
 
+MEDIAPIPE_POSE_NAMES = (
+    "nose", "left_eye_inner", "left_eye", "left_eye_outer", "right_eye_inner",
+    "right_eye", "right_eye_outer", "left_ear", "right_ear", "left_mouth",
+    "right_mouth", "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_pinky", "right_pinky", "left_index",
+    "right_index", "left_thumb", "right_thumb", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle", "left_heel",
+    "right_heel", "left_foot_index", "right_foot_index",
+)
+
 
 @dataclass(frozen=True)
 class Keypoint:
@@ -185,7 +195,10 @@ def summarize_motion(samples: list[dict[str, Any]], frame_width: float, frame_he
                 "angular_velocity_deg_sec": round((values[-1] - values[0]) / duration, 2),
             }
 
-    visible_ratios = [sum(point.confidence >= 0.35 for point in sample["pose"].values()) / 34 for sample in samples]
+    visible_ratios = [
+        sum(point.confidence >= 0.35 for point in sample["pose"].values()) / max(1, len(sample["pose"]))
+        for sample in samples
+    ]
     bbox_heights = [
         (_number(sample["bbox"].get("bottomY")) - _number(sample["bbox"].get("topY"))) / max(1.0, frame_height)
         for sample in samples
@@ -211,6 +224,7 @@ def summarize_motion(samples: list[dict[str, Any]], frame_width: float, frame_he
         "posture_transitions": transitions,
         "quality": {
             "sample_count": len(samples),
+            "pose_source": str(samples[-1].get("pose_source", "rtcv")),
             "visible_keypoints_ratio": round(statistics.fmean(visible_ratios), 3) if visible_ratios else 0.0,
             "missing_keypoints_ratio": round(1 - statistics.fmean(visible_ratios), 3) if visible_ratios else 1.0,
             "pose_confidence": round(statistics.fmean(
@@ -223,6 +237,63 @@ def summarize_motion(samples: list[dict[str, Any]], frame_width: float, frame_he
 
 def facts_json(facts: dict[str, Any]) -> str:
     return json.dumps(facts, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def build_pose_observation(
+    sensor_id: str,
+    frame_id: str,
+    track_id: str,
+    timestamp: float,
+    source_timestamp: float,
+    bbox: dict[str, Any],
+    pose: dict[str, Keypoint],
+    frame_width: float,
+    frame_height: float,
+    person_id: int | None = None,
+    hands: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one compact, versioned JSON observation for mdx-office-pose."""
+    width, height = max(1.0, frame_width), max(1.0, frame_height)
+    confidence_values = [point.confidence for point in pose.values()]
+    normalized_bbox = {
+        "left": round(_number(bbox.get("leftX")) / width, 6),
+        "top": round(_number(bbox.get("topY")) / height, 6),
+        "right": round(_number(bbox.get("rightX")) / width, 6),
+        "bottom": round(_number(bbox.get("bottomY")) / height, 6),
+    }
+    return {
+        "schema_version": "1.0",
+        "type": "office.pose.observation",
+        "sensor_id": sensor_id,
+        "frame_id": frame_id,
+        "timestamp": round(float(timestamp), 6),
+        "source_timestamp": round(float(source_timestamp), 6),
+        "sync_delta_seconds": round(float(timestamp) - float(source_timestamp), 6),
+        "track_id": track_id,
+        "person_id": person_id,
+        "bbox": normalized_bbox,
+        "pose": {
+            "source": "mediapipe",
+            "coordinate_space": "normalized_image",
+            "z_scale": "frame_width",
+            "keypoints": {
+                name: {
+                    "x": round(point.x / width, 6),
+                    "y": round(point.y / height, 6),
+                    "z": round(point.z / width, 6),
+                    "confidence": round(point.confidence, 6),
+                }
+                for name, point in sorted(pose.items())
+            },
+        },
+        "hands": hands or {"available": False, "reason": "not sampled", "observations": []},
+        "quality": {
+            "keypoint_count": len(pose),
+            "mean_pose_confidence": round(statistics.fmean(confidence_values), 6) if confidence_values else 0.0,
+            "frame_width": int(width),
+            "frame_height": int(height),
+        },
+    }
 
 
 class RtspFrameBuffer:
@@ -284,6 +355,14 @@ class RtspFrameBuffer:
     def between(self, start: float, end: float) -> list[tuple[float, bytes]]:
         with self.lock:
             return [(stamp, data) for stamp, data in self.frames if start - 0.5 <= stamp <= end + 0.5]
+
+    def nearest(self, stamp: float, tolerance_seconds: float = 1.5) -> tuple[float, bytes] | None:
+        """Return the closest buffered frame when it is sufficiently synchronized."""
+        with self.lock:
+            if not self.frames:
+                return None
+            candidate = min(self.frames, key=lambda item: abs(item[0] - stamp))
+            return candidate if abs(candidate[0] - stamp) <= tolerance_seconds else None
 
 
 def select_storyboard_frames(
@@ -400,6 +479,118 @@ def build_storyboard(
     return str(output)
 
 
+class MediaPipePoseAnalyzer:
+    """Run MediaPipe Pose on one tracked-person crop and return named image keypoints."""
+
+    def __init__(self, model_path: str = "") -> None:
+        self.model_path = model_path
+        self.landmarker: Any | None = None
+        self.error = ""
+        if not model_path or not Path(model_path).is_file():
+            self.error = "pose model is not configured"
+            return
+        try:
+            import mediapipe as mp
+            import numpy as np
+
+            options = mp.tasks.vision.PoseLandmarkerOptions(
+                base_options=mp.tasks.BaseOptions(model_asset_path=model_path),
+                running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_pose_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_segmentation_masks=False,
+            )
+            self.landmarker = mp.tasks.vision.PoseLandmarker.create_from_options(options)
+            self.mp = mp
+            self.np = np
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            self.error = str(error)
+
+    @staticmethod
+    def _midpoint(name: str, first: Keypoint, second: Keypoint) -> Keypoint:
+        return Keypoint(
+            name,
+            (first.x + second.x) / 2,
+            (first.y + second.y) / 2,
+            (first.z + second.z) / 2,
+            min(first.confidence, second.confidence),
+        )
+
+    def analyze(
+        self,
+        data: bytes,
+        bbox: dict[str, Any],
+        minimum_confidence: float = 0.35,
+        margin: float = 0.2,
+    ) -> dict[str, Keypoint]:
+        if self.landmarker is None:
+            return {}
+        try:
+            image = Image.open(BytesIO(data)).convert("RGB")
+            width, height = image.size
+            left = max(0.0, _number(bbox.get("leftX")))
+            top = max(0.0, _number(bbox.get("topY")))
+            right = min(float(width), _number(bbox.get("rightX"), float(width)))
+            bottom = min(float(height), _number(bbox.get("bottomY"), float(height)))
+            if right <= left or bottom <= top:
+                return {}
+            margin_x, margin_y = (right - left) * margin, (bottom - top) * margin
+            crop_left, crop_top = max(0.0, left - margin_x), max(0.0, top - margin_y)
+            crop_right, crop_bottom = min(float(width), right + margin_x), min(float(height), bottom + margin_y)
+            cropped = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+            result = self.landmarker.detect(self.mp.Image(
+                image_format=self.mp.ImageFormat.SRGB,
+                data=self.np.asarray(cropped),
+            ))
+        except (OSError, RuntimeError, ValueError) as error:
+            self.error = str(error)
+            return {}
+        if not result.pose_landmarks:
+            return {}
+        crop_width, crop_height = cropped.size
+        pose: dict[str, Keypoint] = {}
+        for name, landmark in zip(MEDIAPIPE_POSE_NAMES, result.pose_landmarks[0], strict=False):
+            confidence = min(
+                _number(getattr(landmark, "visibility", 1.0), 1.0),
+                _number(getattr(landmark, "presence", 1.0), 1.0),
+            )
+            if confidence < minimum_confidence:
+                continue
+            pose[name] = Keypoint(
+                name,
+                crop_left + float(landmark.x) * crop_width,
+                crop_top + float(landmark.y) * crop_height,
+                float(landmark.z) * crop_width,
+                confidence,
+            )
+        required_pairs = {
+            "neck": ("left_shoulder", "right_shoulder"),
+            "pelvis": ("left_hip", "right_hip"),
+        }
+        for name, (first_name, second_name) in required_pairs.items():
+            if first_name in pose and second_name in pose:
+                pose[name] = self._midpoint(name, pose[first_name], pose[second_name])
+        if "neck" in pose and "pelvis" in pose:
+            pose["torso"] = self._midpoint("torso", pose["neck"], pose["pelvis"])
+            pose["spine"] = pose["torso"]
+        if "nose" in pose and "neck" in pose:
+            nose, neck = pose["nose"], pose["neck"]
+            pose["head_top"] = Keypoint(
+                "head_top",
+                nose.x + 0.45 * (nose.x - neck.x),
+                nose.y + 0.45 * (nose.y - neck.y),
+                nose.z + 0.45 * (nose.z - neck.z),
+                min(nose.confidence, neck.confidence),
+            )
+        for side in ("left", "right"):
+            foot = pose.get(f"{side}_foot_index")
+            if foot:
+                pose[f"{side}_big_toe"] = foot
+        return pose
+
+
 class MediaPipeHandAnalyzer:
     """Optional MediaPipe Tasks adapter; absence degrades to explicit unavailable evidence."""
 
@@ -450,6 +641,11 @@ class MediaPipeHandAnalyzer:
                 hands.append({
                     "handedness": handedness,
                     "landmark_count": len(landmarks),
+                    "coordinate_space": "normalized_person_crop",
+                    "landmarks": [
+                        [round(float(point.x), 5), round(float(point.y), 5), round(float(point.z), 5)]
+                        for point in landmarks
+                    ],
                     "wrist": [round(float(landmarks[0].x), 5), round(float(landmarks[0].y), 5), round(float(landmarks[0].z), 5)],
                     "fingertips": {
                         name: [round(float(landmarks[position].x), 5), round(float(landmarks[position].y), 5), round(float(landmarks[position].z), 5)]

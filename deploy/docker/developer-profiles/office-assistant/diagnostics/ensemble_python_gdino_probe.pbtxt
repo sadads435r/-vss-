@@ -1,0 +1,67 @@
+name: "ensemble_python_gdino"
+platform: "ensemble"
+max_batch_size: 1
+input [
+  { name: "inputs" data_type: TYPE_FP32 dims: [544,960,3] },
+  { name: "PROMPT" data_type: TYPE_UINT8 dims: [2048] }
+]
+output [
+  { name: "labels" data_type: TYPE_INT32 dims: [-1,300] },
+  { name: "boxes" data_type: TYPE_FP32 dims: [-1,300,4] },
+  { name: "scores" data_type: TYPE_FP32 dims: [-1,300] }
+]
+ensemble_scheduling {
+  step [
+    {
+      model_name: "gdino_input_probe"
+      model_version: -1
+      input_map [{ key: "INPUT" value: "inputs" }]
+      output_map [{ key: "OUTPUT" value: "probed_inputs" }]
+    },
+    {
+      model_name: "gdino_preprocess"
+      model_version: -1
+      input_map [{ key: "PROMPT" value: "PROMPT" }]
+      output_map [
+        { key: "input_ids" value: "input_ids" },
+        { key: "attention_mask" value: "attention_mask" },
+        { key: "position_ids" value: "position_ids" },
+        { key: "token_type_ids" value: "token_type_ids" },
+        { key: "text_token_mask" value: "text_token_mask" },
+        { key: "pos_map" value: "pos_map" },
+        { key: "target_sizes" value: "target_sizes" }
+      ]
+    },
+    {
+      model_name: "gdino_trt"
+      model_version: -1
+      input_map [
+        { key: "inputs" value: "probed_inputs" },
+        { key: "input_ids" value: "input_ids" },
+        { key: "attention_mask" value: "attention_mask" },
+        { key: "position_ids" value: "position_ids" },
+        { key: "token_type_ids" value: "token_type_ids" },
+        { key: "text_token_mask" value: "text_token_mask" }
+      ]
+      output_map [
+        { key: "pred_logits" value: "pred_logits" },
+        { key: "pred_boxes" value: "pred_boxes" }
+      ]
+    },
+    {
+      model_name: "gdino_postprocess"
+      model_version: -1
+      input_map [
+        { key: "pred_logits" value: "pred_logits" },
+        { key: "pred_boxes" value: "pred_boxes" },
+        { key: "pos_map" value: "pos_map" },
+        { key: "target_sizes" value: "target_sizes" }
+      ]
+      output_map [
+        { key: "labels" value: "labels" },
+        { key: "boxes" value: "boxes" },
+        { key: "scores" value: "scores" }
+      ]
+    }
+  ]
+}

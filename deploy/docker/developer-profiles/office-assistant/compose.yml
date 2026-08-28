@@ -1,6 +1,44 @@
 name: vss-office-assistant
 
 services:
+  gdino-object-detector:
+    image: nvcr.io/nvidia/vss-core/vss-rt-cv:3.2.1-sbsa
+    container_name: office-gdino-object
+    network_mode: host
+    restart: unless-stopped
+    gpus: all
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ../../engines:/opt/engines:ro
+      - ../../data-dir/models:/opt/storage:ro
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - >-
+        cp /opt/engines/gdino/model_gdino_trt.plan
+        /opt/nvidia/deepstream/deepstream/sources/TritonGdino/triton_model_repo/gdino_trt/1/model.plan
+        && sed -i -E 's/max_batch_size: [0-9]+/max_batch_size: 1/'
+        /opt/nvidia/deepstream/deepstream/sources/TritonGdino/triton_model_repo/ensemble_python_gdino/config.pbtxt
+        /opt/nvidia/deepstream/deepstream/sources/TritonGdino/triton_model_repo/gdino_trt/config.pbtxt
+        /opt/nvidia/deepstream/deepstream/sources/TritonGdino/triton_model_repo/gdino_preprocess/config.pbtxt
+        /opt/nvidia/deepstream/deepstream/sources/TritonGdino/triton_model_repo/gdino_postprocess/config.pbtxt
+        && exec /opt/tritonserver/bin/tritonserver
+        --model-repository=/opt/nvidia/deepstream/deepstream/sources/TritonGdino/triton_model_repo
+        --model-control-mode=explicit
+        --load-model=ensemble_python_gdino
+        --http-address=127.0.0.1 --http-port=18000
+        --grpc-address=127.0.0.1 --grpc-port=18001
+        --metrics-address=127.0.0.1 --metrics-port=18002
+        --log-verbose=0
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18000/v2/health/ready"]
+      interval: 15s
+      timeout: 4s
+      retries: 10
+      start_period: 45s
+
   cosmos3-classifier:
     build:
       context: ./cosmos3-server
@@ -80,6 +118,8 @@ services:
       OFFICE_CONFIG_FILE: /config/office-config.yaml
       OFFICE_DATABASE_FILE: /data/office.db
       OFFICE_CLIP_DIR: /data/clips
+      MPLCONFIGDIR: /tmp/mplconfig
+      FONTCONFIG_PATH: /tmp/fontconfig
       ELASTICSEARCH_URL: http://127.0.0.1:${ELASTICSEARCH_PORT:-9200}
       VSS_AGENT_URL: http://127.0.0.1:${VSS_AGENT_PORT:-8000}
       VSS_VST_URL: http://127.0.0.1:${VSS_VST_PORT:-30888}
@@ -105,10 +145,18 @@ services:
       OFFICE_CONFIG_FILE: /config/office-config.yaml
       OFFICE_DATABASE_FILE: /data/office.db
       OFFICE_CLIP_DIR: /data/clips
+      MPLCONFIGDIR: /tmp/mplconfig
+      FONTCONFIG_PATH: /tmp/fontconfig
       OFFICE_API_PORT: ${OFFICE_API_PORT:-8090}
       OFFICE_KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP:-127.0.0.1:9092}
       OFFICE_RTCV_TOPIC: ${MOTION_TOPIC:-mdx-raw}
       OFFICE_MOTION_CONSUMER_GROUP: ${MOTION_GROUP:-office-motion-v1}
+      # Pose publishing runs in the dedicated collector below, so VLM latency cannot
+      # throttle observations or observation load cannot inflate the activity queue.
+      OFFICE_POSE_PUBLISH_ENABLED: "false"
+      OFFICE_POSE_TOPIC: ${OFFICE_POSE_TOPIC:-mdx-office-pose}
+      OFFICE_POSE_INTERVAL_SECONDS: ${OFFICE_POSE_INTERVAL_SECONDS:-0.5}
+      OFFICE_POSE_HANDS_ENABLED: ${OFFICE_POSE_HANDS_ENABLED:-true}
     volumes:
       - ../../../../config/:/config/:ro
       - ../../../../data/office-assistant:/data
@@ -124,6 +172,78 @@ services:
       timeout: 4s
       retries: 10
       start_period: 60s
+
+  office-pose-collector:
+    image: vss-office-assistant-office-api:latest
+    build:
+      context: ./office-api
+    container_name: office-pose-collector
+    network_mode: host
+    restart: unless-stopped
+    user: ${OFFICE_UID:-1000}:${OFFICE_GID:-1000}
+    entrypoint: ["python", "/app/pose_collector.py"]
+    environment:
+      OFFICE_CONFIG_FILE: /config/office-config.yaml
+      OFFICE_DATABASE_FILE: /data/office.db
+      OFFICE_CLIP_DIR: /data/clips
+      MPLCONFIGDIR: /tmp/mplconfig
+      FONTCONFIG_PATH: /tmp/fontconfig
+      OFFICE_API_PORT: ${OFFICE_API_PORT:-8090}
+      OFFICE_KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP:-127.0.0.1:9092}
+      OFFICE_RTCV_TOPIC: ${MOTION_TOPIC:-mdx-raw}
+      OFFICE_POSE_CONSUMER_GROUP: ${OFFICE_POSE_GROUP:-office-pose-collector-v1}
+      OFFICE_POSE_PUBLISH_ENABLED: ${OFFICE_POSE_PUBLISH_ENABLED:-true}
+      OFFICE_POSE_TOPIC: ${OFFICE_POSE_TOPIC:-mdx-office-pose}
+      OFFICE_POSE_INTERVAL_SECONDS: ${OFFICE_POSE_INTERVAL_SECONDS:-0.5}
+      OFFICE_POSE_HANDS_ENABLED: ${OFFICE_POSE_HANDS_ENABLED:-true}
+    volumes:
+      - ../../../../config/:/config/:ro
+      - ../../../../data/office-assistant:/data
+      - ${MEDIAPIPE_MODEL_DIR:-../../../../data/models/mediapipe}:/models/mediapipe:ro
+    depends_on:
+      office-api:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+
+  office-flywheel-worker:
+    image: vss-office-assistant-office-api:latest
+    build:
+      context: ./office-api
+    container_name: office-flywheel-worker
+    network_mode: host
+    restart: unless-stopped
+    user: ${OFFICE_UID:-1000}:${OFFICE_GID:-1000}
+    entrypoint: ["python", "/app/flywheel_worker.py"]
+    environment:
+      OFFICE_DATABASE_FILE: /data/office.db
+      OFFICE_KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP:-127.0.0.1:9092}
+      OFFICE_POSE_TOPIC: ${OFFICE_POSE_TOPIC:-mdx-office-pose}
+      OFFICE_FLYWHEEL_GROUP: ${OFFICE_FLYWHEEL_GROUP:-office-flywheel-v1}
+      OFFICE_RECORDINGS_DIR: /recordings
+      OFFICE_FLYWHEEL_KNOWN_PEOPLE_ONLY: ${OFFICE_FLYWHEEL_KNOWN_PEOPLE_ONLY:-true}
+      OFFICE_FLYWHEEL_MOUTH_DISTANCE: ${OFFICE_FLYWHEEL_MOUTH_DISTANCE:-0.28}
+      OFFICE_FLYWHEEL_MIN_WRIST_CONFIDENCE: ${OFFICE_FLYWHEEL_MIN_WRIST_CONFIDENCE:-0.55}
+      OFFICE_FLYWHEEL_MIN_NEAR_SECONDS: ${OFFICE_FLYWHEEL_MIN_NEAR_SECONDS:-0.8}
+      OFFICE_FLYWHEEL_EXIT_SECONDS: ${OFFICE_FLYWHEEL_EXIT_SECONDS:-0.9}
+      OFFICE_FLYWHEEL_COOLDOWN_SECONDS: ${OFFICE_FLYWHEEL_COOLDOWN_SECONDS:-30}
+      OFFICE_FLYWHEEL_PRE_ROLL_SECONDS: ${OFFICE_FLYWHEEL_PRE_ROLL_SECONDS:-3}
+      OFFICE_FLYWHEEL_POST_ROLL_SECONDS: ${OFFICE_FLYWHEEL_POST_ROLL_SECONDS:-3}
+      OFFICE_GDINO_URL: http://127.0.0.1:18000/v2/models/ensemble_python_gdino/infer
+      OFFICE_GDINO_PROMPT: ${OFFICE_GDINO_PROMPT:-cup . mug . bottle . water bottle .}
+      OFFICE_GDINO_THRESHOLD: ${OFFICE_GDINO_THRESHOLD:-0.40}
+      OFFICE_GDINO_HIGH_THRESHOLD: ${OFFICE_GDINO_HIGH_THRESHOLD:-0.65}
+      OFFICE_GDINO_REQUIRED_FRAMES: ${OFFICE_GDINO_REQUIRED_FRAMES:-2}
+    volumes:
+      - ../../../../data/office-assistant:/data
+      - ../../../../data/office-assistant/rolling-recordings:/recordings:ro
+    depends_on:
+      office-api:
+        condition: service_healthy
+      mediamtx:
+        condition: service_started
+      gdino-object-detector:
+        condition: service_healthy
 
   office-proxy:
     image: caddy:2.10.0-alpine

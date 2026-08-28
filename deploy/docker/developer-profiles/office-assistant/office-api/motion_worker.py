@@ -13,12 +13,72 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, Producer
+from google.protobuf.json_format import MessageToDict
 
+import nv_pb2
 from app import CONFIG_FILE, DATABASE_FILE, ELASTICSEARCH_URL, VSS_VST_URL, load_config
 from workstation import WorkstationEngine, initialize_schema
 
 LOGGER = logging.getLogger("office-motion-worker")
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, "true" if default else "false").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
+class PoseTopicPublisher:
+    """Best-effort JSON publisher isolated from the existing activity pipeline."""
+
+    def __init__(self, bootstrap_servers: str, topic: str, enabled: bool) -> None:
+        self.topic = topic
+        self.enabled = enabled
+        self.sent = 0
+        self.failed = 0
+        self.last_report_at = time.time()
+        self.producer = Producer({
+            "bootstrap.servers": bootstrap_servers,
+            "client.id": "office-pose-collector",
+            "compression.type": "zstd",
+            "linger.ms": 50,
+            "enable.idempotence": True,
+        }) if enabled else None
+
+    def _delivered(self, error: Any, _message: Any) -> None:
+        if error is not None:
+            self.failed += 1
+            LOGGER.warning("pose delivery failed: %s", error)
+        else:
+            self.sent += 1
+
+    def publish(self, observation: dict[str, Any]) -> None:
+        if self.producer is None:
+            return
+        payload = json.dumps(observation, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        key = f"{observation.get('sensor_id', '')}:{observation.get('track_id', '')}"
+        try:
+            self.producer.produce(self.topic, key=key.encode("utf-8"), value=payload, on_delivery=self._delivered)
+        except BufferError:
+            self.producer.poll(0.25)
+            self.producer.produce(self.topic, key=key.encode("utf-8"), value=payload, on_delivery=self._delivered)
+        self.producer.poll(0)
+
+    def report(self) -> None:
+        if self.producer is None:
+            return
+        self.producer.poll(0)
+        current = time.time()
+        if current - self.last_report_at >= 60:
+            LOGGER.info("pose collector topic=%s sent=%d failed=%d", self.topic, self.sent, self.failed)
+            self.last_report_at = current
+
+    def close(self) -> None:
+        if self.producer is not None:
+            remaining = self.producer.flush(10)
+            if remaining:
+                LOGGER.warning("pose collector closed with %d undelivered messages", remaining)
 
 
 def normalize_timestamp(value: Any) -> str | float:
@@ -58,8 +118,20 @@ def main() -> None:
     initialize_schema(DATABASE_FILE)
     engine = WorkstationEngine(config, DATABASE_FILE, CONFIG_FILE, ELASTICSEARCH_URL, VSS_VST_URL)
     engine.enable_motion_runtime()
+    bootstrap_servers = os.environ.get("OFFICE_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
+    pose_publisher = PoseTopicPublisher(
+        bootstrap_servers,
+        os.environ.get("OFFICE_POSE_TOPIC", "mdx-office-pose"),
+        env_flag("OFFICE_POSE_PUBLISH_ENABLED", False),
+    )
+    if pose_publisher.enabled:
+        engine.pose_observer = pose_publisher.publish
+        engine.pose_observe_hands = env_flag("OFFICE_POSE_HANDS_ENABLED", True)
+        engine.pose_observation_interval_seconds = max(
+            0.1, float(os.environ.get("OFFICE_POSE_INTERVAL_SECONDS", "0.5")),
+        )
     consumer = Consumer({
-        "bootstrap.servers": os.environ.get("OFFICE_KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092"),
+        "bootstrap.servers": bootstrap_servers,
         "group.id": os.environ.get("OFFICE_MOTION_CONSUMER_GROUP", "office-motion-v1"),
         "auto.offset.reset": "latest",
         "enable.auto.commit": True,
@@ -71,7 +143,10 @@ def main() -> None:
             config["camera"].get("id", ""), config["camera"].get("vss_sensor_id", ""),
         ) if str(value).strip()
     }
-    LOGGER.info("motion worker subscribed topic=%s cameras=%s database=%s", topic, sorted(camera_ids), Path(DATABASE_FILE))
+    LOGGER.info(
+        "motion worker subscribed topic=%s cameras=%s database=%s pose_topic=%s pose_enabled=%s",
+        topic, sorted(camera_ids), Path(DATABASE_FILE), pose_publisher.topic, pose_publisher.enabled,
+    )
     last_analysis = 0.0
     try:
         while True:
@@ -82,7 +157,11 @@ def main() -> None:
                         LOGGER.warning("Kafka error: %s", message.error())
                 else:
                     try:
-                        frame = normalize_message(json.loads(message.value().decode("utf-8")))
+                        # mdx-raw carries a binary nv.Frame protobuf emitted by RT-CV (not JSON).
+                        nv_frame = nv_pb2.Frame()
+                        nv_frame.ParseFromString(message.value())
+                        decoded = MessageToDict(nv_frame, preserving_proto_field_name=True)
+                        frame = normalize_message(decoded)
                         if not camera_ids or str(frame.get("sensorId", "")) in camera_ids:
                             engine.process_motion_frame(frame)
                     except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
@@ -91,8 +170,10 @@ def main() -> None:
             if current - last_analysis >= 0.5:
                 engine.analyze_pending_motion(current)
                 last_analysis = current
+            pose_publisher.report()
     finally:
         consumer.close()
+        pose_publisher.close()
         if engine.frame_buffer is not None:
             engine.frame_buffer.stop()
 

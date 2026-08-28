@@ -5,6 +5,8 @@ import math
 import unittest
 
 from motion import Keypoint
+from motion import RtspFrameBuffer
+from motion import build_pose_observation
 from motion import cosine_similarity
 from motion import joint_angle
 from motion import parse_pose
@@ -34,6 +36,37 @@ def sample(timestamp: float, center_x: float, knee_y: float = 0.7) -> dict:
 
 
 class MotionTest(unittest.TestCase):
+    def test_pose_observation_is_versioned_and_normalized(self) -> None:
+        pose = {
+            "nose": point("nose", 500, 250, -25, 0.9),
+            "left_wrist": point("left_wrist", 250, 500, 50, 0.8),
+        }
+        observation = build_pose_observation(
+            sensor_id="office-main",
+            frame_id="frame-1",
+            track_id="42",
+            timestamp=10.25,
+            source_timestamp=10.0,
+            bbox={"leftX": 100, "topY": 200, "rightX": 900, "bottomY": 800},
+            pose=pose,
+            frame_width=1000,
+            frame_height=1000,
+            person_id=3,
+        )
+        self.assertEqual(observation["schema_version"], "1.0")
+        self.assertEqual(observation["type"], "office.pose.observation")
+        self.assertEqual(observation["person_id"], 3)
+        self.assertAlmostEqual(observation["pose"]["keypoints"]["nose"]["x"], 0.5)
+        self.assertAlmostEqual(observation["pose"]["keypoints"]["nose"]["z"], -0.025)
+        self.assertEqual(observation["bbox"]["bottom"], 0.8)
+        self.assertEqual(observation["quality"]["keypoint_count"], 2)
+
+    def test_frame_buffer_nearest_enforces_tolerance(self) -> None:
+        buffer = RtspFrameBuffer("rtsp://unused")
+        buffer.frames.extend([(10.0, b"first"), (12.0, b"second")])
+        self.assertEqual(buffer.nearest(11.8, 0.5), (12.0, b"second"))
+        self.assertIsNone(buffer.nearest(20.0, 1.5))
+
     def test_parses_flat_bodypose_25d(self) -> None:
         values = []
         for index in range(34):
