@@ -31,9 +31,10 @@ else
   exit 2
 fi
 
-echo "[camera-gateway] Publishing ${device} as ${publish_url} (${width}x${height}@${fps})"
+echo "[camera-gateway] Publishing ${device} as ${publish_url} (${width}x${height}@${fps}, single-slice H.264)"
 exec gst-launch-1.0 -e "${source_chain[@]}" \
   ! videoconvert \
-  ! x264enc tune=zerolatency speed-preset=ultrafast bitrate="${bitrate}" bframes=0 key-int-max="${fps}" \
+  ! "video/x-raw,format=I420" \
+  ! x264enc tune=zerolatency speed-preset=ultrafast bitrate="${bitrate}" bframes=0 key-int-max="${fps}" sliced-threads=false threads=1 \
   ! h264parse config-interval=-1 \
   ! rtspclientsink location="${publish_url}" protocols=tcp

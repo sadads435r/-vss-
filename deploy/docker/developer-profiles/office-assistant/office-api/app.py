@@ -27,6 +27,8 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
+from flywheel import FlywheelStore
+from flywheel import initialize_flywheel_schema
 from workstation import WorkstationEngine
 from workstation import default_config as default_workstation_config
 from workstation import initialize_schema as initialize_workstation_schema
@@ -38,6 +40,7 @@ DATABASE_FILE = Path(os.environ.get("OFFICE_DATABASE_FILE", "/data/office.db"))
 CLIP_DIR = Path(os.environ.get("OFFICE_CLIP_DIR", "/data/clips"))
 ELASTICSEARCH_URL = os.environ.get("ELASTICSEARCH_URL", "http://127.0.0.1:9200").rstrip("/")
 VSS_AGENT_URL = os.environ.get("VSS_AGENT_URL", "http://127.0.0.1:8000").rstrip("/")
+VSS_AGENT_CHAT_URL = os.environ.get("VSS_AGENT_CHAT_URL", f"{VSS_AGENT_URL}/chat/stream")
 VSS_VST_URL = os.environ.get("VSS_VST_URL", "http://127.0.0.1:30888").rstrip("/")
 STATIC_DIR = Path(__file__).with_name("static")
 
@@ -125,6 +128,7 @@ def initialize_database() -> None:
             "CREATE TABLE IF NOT EXISTS occupancy_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
     initialize_workstation_schema(DATABASE_FILE)
+    initialize_flywheel_schema(DATABASE_FILE)
 
 
 def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
@@ -531,7 +535,13 @@ class OfficeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            # The mutation may already be committed even if a browser navigates away
+            # before reading the response. Avoid turning that disconnect into a
+            # second error response and let idempotent callers safely retry.
+            return
 
     def send_static(self, path: Path, content_type: str) -> None:
         body = path.read_bytes()
@@ -561,7 +571,10 @@ class OfficeHandler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/healthz":
                 self.send_json(HTTPStatus.OK, {"status": "ok"})
-            elif parsed.path in ("/office", "/office/"):
+            elif parsed.path in (
+                "/office", "/office/", "/office/settings", "/office/settings/",
+                "/office/agent", "/office/agent/", "/office/flywheel", "/office/flywheel/",
+            ):
                 self.send_static(STATIC_DIR / "index.html", "text/html; charset=utf-8")
             elif parsed.path == "/api/config":
                 self.send_json(HTTPStatus.OK, self.server.office_config)  # type: ignore[attr-defined]
@@ -610,6 +623,48 @@ class OfficeHandler(BaseHTTPRequestHandler):
                     self.send_json(HTTPStatus.NOT_FOUND, {"error": "activity evidence not found"})
             elif parsed.path == "/api/motion/status":
                 self.send_json(HTTPStatus.OK, self.server.workstation.motion_status())  # type: ignore[attr-defined]
+            elif parsed.path == "/api/flywheel/status":
+                self.send_json(HTTPStatus.OK, self.server.flywheel.status())  # type: ignore[attr-defined]
+            elif parsed.path == "/api/flywheel/candidates":
+                query = urllib.parse.parse_qs(parsed.query)
+                review = str(query.get("review", ["all"])[0])
+                person_id = int(query["person_id"][0]) if query.get("person_id") else None
+                limit = int(query.get("limit", ["100"])[0])
+                self.send_json(HTTPStatus.OK, {  # type: ignore[attr-defined]
+                    "candidates": self.server.flywheel.candidates(
+                        review=review, person_id=person_id, limit=limit,
+                    ),
+                })
+            elif parsed.path == "/api/flywheel/export":
+                destination, counts = self.server.flywheel.export_jsonl()  # type: ignore[attr-defined]
+                body = destination.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{destination.name}"')
+                self.send_header("X-Dataset-Splits", json.dumps(counts, separators=(",", ":")))
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            elif parsed.path.startswith("/api/flywheel/candidates/") and parsed.path.endswith("/clip"):
+                candidate_id = int(
+                    parsed.path.removeprefix("/api/flywheel/candidates/").removesuffix("/clip").strip("/")
+                )
+                clip = self.server.flywheel.clip(candidate_id)  # type: ignore[attr-defined]
+                if clip:
+                    self.send_static(clip, "video/mp4")
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "flywheel clip not ready"})
+            elif parsed.path.startswith("/api/flywheel/candidates/") and parsed.path.endswith("/training-clip"):
+                candidate_id = int(
+                    parsed.path.removeprefix("/api/flywheel/candidates/")
+                    .removesuffix("/training-clip").strip("/")
+                )
+                clip = self.server.flywheel.training_clip(candidate_id)  # type: ignore[attr-defined]
+                if clip:
+                    self.send_static(clip, "video/mp4")
+                else:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "training clip not ready"})
             elif parsed.path == "/api/people":
                 self.send_json(HTTPStatus.OK, {"people": self.server.workstation.people_list()})  # type: ignore[attr-defined]
             elif parsed.path.startswith("/api/people/") and "/images/" in parsed.path:
@@ -693,6 +748,33 @@ class OfficeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/agent/query":
+            try:
+                incoming = self.read_json(maximum=65536)
+                raw_messages = incoming.get("messages", [])
+                if not isinstance(raw_messages, list) or not raw_messages:
+                    raise ValueError("messages must be a non-empty array")
+                messages = []
+                for item in raw_messages[-12:]:
+                    if not isinstance(item, dict):
+                        continue
+                    role = str(item.get("role", "user"))
+                    content = str(item.get("content", "")).strip()[:4000]
+                    if role in {"user", "assistant"} and content:
+                        messages.append({"role": role, "content": content})
+                if not messages or messages[-1]["role"] != "user":
+                    raise ValueError("the last message must be a user question")
+                body = json.dumps({"messages": messages, "stream": False}).encode("utf-8")
+                request = urllib.request.Request(VSS_AGENT_CHAT_URL, data=body, method="POST")
+                request.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(request, timeout=180) as response:
+                    result = response.read(10 * 1024 * 1024)
+                self.send_bytes(HTTPStatus.OK, result, "text/event-stream; charset=utf-8")
+            except ValueError as error:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            except (OSError, urllib.error.URLError) as error:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"error": f"VSS Agent unavailable: {error}"})
+            return
         if not parsed.path.endswith("/acknowledge") or not parsed.path.startswith("/api/events/"):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -711,12 +793,56 @@ class OfficeHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         try:
+            if parsed.path.startswith("/api/flywheel/candidates/") and parsed.path.endswith("/trim"):
+                candidate_id = int(
+                    parsed.path.removeprefix("/api/flywheel/candidates/").removesuffix("/trim").strip("/")
+                )
+                payload = self.read_json()
+                candidate = self.server.flywheel.trim_candidate(  # type: ignore[attr-defined]
+                    candidate_id, float(payload.get("start", -1)), float(payload.get("end", -1)),
+                )
+                if not candidate:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "flywheel candidate not found"})
+                    return
+                self.send_json(HTTPStatus.OK, candidate)
+                return
+            if parsed.path.startswith("/api/flywheel/candidates/") and parsed.path.endswith("/label"):
+                candidate_id = int(
+                    parsed.path.removeprefix("/api/flywheel/candidates/").removesuffix("/label").strip("/")
+                )
+                payload = self.read_json()
+                candidate = self.server.flywheel.label(  # type: ignore[attr-defined]
+                    candidate_id,
+                    str(payload.get("label", "")),
+                    subtype=str(payload.get("subtype", "")),
+                    note=str(payload.get("note", "")),
+                    annotator=str(payload.get("annotator", "local-reviewer")),
+                )
+                if not candidate:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "flywheel candidate not found"})
+                    return
+                self.send_json(HTTPStatus.OK, candidate)
+                return
             if parsed.path == "/api/workstation/roi":
                 payload = self.read_json()
                 polygon = payload.get("chair_roi")
                 if not isinstance(polygon, list):
                     raise ValueError("chair_roi must be a polygon array")
                 self.send_json(HTTPStatus.OK, self.server.workstation.save_roi(polygon))  # type: ignore[attr-defined]
+                return
+            if parsed.path.startswith("/api/people/") and parsed.path.endswith("/merge"):
+                source_person_id = int(
+                    parsed.path.removeprefix("/api/people/").removesuffix("/merge").strip("/")
+                )
+                payload = self.read_json()
+                target_person_id = int(payload.get("target_person_id", 0))
+                result = self.server.workstation.merge_person(  # type: ignore[attr-defined]
+                    source_person_id, target_person_id,
+                )
+                if not result:
+                    self.send_json(HTTPStatus.NOT_FOUND, {"error": "source or target person not found"})
+                    return
+                self.send_json(HTTPStatus.OK, result)
                 return
             if parsed.path.startswith("/api/people/") and parsed.path.endswith("/name"):
                 person_id = int(parsed.path.removeprefix("/api/people/").removesuffix("/name").strip("/"))
@@ -728,7 +854,7 @@ class OfficeHandler(BaseHTTPRequestHandler):
                 self.send_json(HTTPStatus.OK, {"person_id": person_id, "name": name})
                 return
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-        except (ConfigurationError, ValueError, OSError, json.JSONDecodeError) as error:
+        except (ConfigurationError, ValueError, OSError, json.JSONDecodeError, sqlite3.Error) as error:
             self.send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
     def do_DELETE(self) -> None:  # noqa: N802
@@ -753,6 +879,7 @@ def main() -> None:
     threading.Thread(target=maintenance_worker, args=(config,), daemon=True).start()
     threading.Thread(target=occupancy_worker, args=(config,), daemon=True).start()
     workstation = WorkstationEngine(config, DATABASE_FILE, CONFIG_FILE, ELASTICSEARCH_URL, VSS_VST_URL)
+    flywheel = FlywheelStore(DATABASE_FILE)
     threading.Thread(
         target=workstation_worker,
         args=(workstation, lambda: fetch_latest_frame(config), float(config["occupancy"].get("poll_seconds", 2))),
@@ -762,6 +889,7 @@ def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", port), OfficeHandler)
     server.office_config = config  # type: ignore[attr-defined]
     server.workstation = workstation  # type: ignore[attr-defined]
+    server.flywheel = flywheel  # type: ignore[attr-defined]
     print(f"[office-api] listening on http://127.0.0.1:{port}", flush=True)
     server.serve_forever()
 

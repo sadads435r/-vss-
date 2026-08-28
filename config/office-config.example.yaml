@@ -43,6 +43,9 @@ workstation:
   # per-person single-image classifier above.
   motion_pipeline:
     enabled: true
+    pose_source: mediapipe
+    mediapipe_pose_model: /models/mediapipe/pose_landmarker_lite.task
+    pose_frame_tolerance_seconds: 1.5
     window_seconds: 8
     step_seconds: 2
     semantic_interval_seconds: 10
@@ -58,6 +61,8 @@ workstation:
   identity:
     confirmation_samples: 2
     cosmos_match_confidence: 0.85
+    strong_match_confidence: 0.95
+    strong_reid_similarity: 0.80
     candidate_limit: 3
     gallery_limit: 5
     minimum_image_height: 256

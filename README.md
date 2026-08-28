@@ -1,41 +1,56 @@
-# DGX Spark 每日活动日志助手
+# 视觉日记：办公室多模态行为分析与数据飞轮
 
-这是一个基于 NVIDIA Video Search and Summarization（VSS）的自定义扩展，用 USB 实时摄像头按已登记人员记录一天中的可见活动。系统将连续观察合并成“10:15–10:40 在电脑前工作”这样的时间段，并允许通过网页或 VSS Agent 查询。
+这是一个基于 NVIDIA Video Search and Summarization（VSS）的办公室多人行为分析扩展。系统通过 DeepStream、GDINO、NvDCF/ReID、MediaPipe 与 Cosmos3，将 USB/RTSP 摄像头中的连续视频整理为按人物、日期和时间排列的活动记录，并提供自然语言查询、人物库管理、椅子 ROI 标定、事件视频复核、人工标注和 Cosmos3 LoRA 微调能力。
+
+系统只描述画面中对应人物的可见动作，不读取屏幕内容，不把环境或其他人的动作混入描述，也不推测工作目的、情绪或健康状态。
 
 > 本扩展不是 NVIDIA 官方产品。仓库保留 NVIDIA VSS 的原始代码、历史、许可证和下方的官方项目说明；自定义功能集中在 `office-assistant` 目录、配置和部署脚本中。
+
+## 系统界面
+
+| 今日概览与人物时间线 | 数据飞轮标注 | 人物与摄像头管理 |
+| --- | --- | --- |
+| [![今日概览](docs/images/office-assistant-overview.png)](docs/images/office-assistant-overview.png) | [![数据飞轮](docs/images/office-assistant-flywheel.png)](docs/images/office-assistant-flywheel.png) | [![人物与 ROI 管理](docs/images/office-assistant-management.png)](docs/images/office-assistant-management.png) |
 
 ## 工作方式
 
 ```mermaid
 flowchart LR
     A[USB 实时摄像头] --> B[MediaMTX / VST]
-    B --> C[RT-CV 人物检测与跟踪]
-    C --> D{人物脚点在椅子 ROI 内?}
-    D -- 否 --> E[忽略路过人员 / 停止调用 Cosmos3]
-    D -- 是 --> F[截取椅子 ROI 当前帧]
-    F --> G[Cosmos3-Nano 16B 保守活动描述]
-    G --> H[变化确认与 SQLite 连续事件]
-    H --> I[每日活动日志网页与 Agent 查询]
+    B --> C[RT-CV / GDINO 人物与目标物检测]
+    C --> D[NvDCF 跟踪与 ReID 人物关联]
+    C --> E[MediaPipe 身体和手部姿态]
+    D --> F[mdx-raw]
+    E --> G[mdx-office-pose]
+    F --> H[规则、ROI、时序和身份融合]
+    G --> H
+    H --> I[活动事件与人物时间线]
+    H --> J[候选视频裁剪]
+    J --> K[Cosmos3 二次判断与人工标注]
+    K --> L[SFT 数据集与 BF16 LoRA]
+    I --> M[Office UI / VSS Agent 查询]
 ```
 
-RT-CV 持续判断画面内是否有人。Office API 对已登记人员默认每 10 秒轮询一次可见活动，并保留原有单工位 20 秒采样；人在离座缓冲期内不会继续调用模型。
+RT-CV 持续输出人物框、tracker 和 ReID 特征，MediaPipe 通过独立 `mdx-office-pose` 数据流提供身体与手部关键点。行为 worker 将姿态、椅子 ROI、时间连续性、人物身份和杯/瓶等目标物证据融合，生成活动事件或训练候选。Cosmos3 负责对事件视频做保守的二次判断，人工标签才是进入训练集的最终依据。
 
 ## 当前功能
 
-- 单摄像头、单椅子 ROI 匿名分析。
-- 当前在座状态、连续在座时间和当前行为。
-- 每日在座时长、专注时长、专注率、首次到岗和最后离岗。
-- 电脑操作、阅读、书写、手机、交谈、休息和无法判断的行为时长。
-- 按已识别人员生成带起止时间、保守描述、置信度和观察次数的连续活动事件。
-- 按日期、人员和关键词浏览网页时间线，或让 Agent 查询和总结历史活动。
-- 离座次数、离座总时长和超过 60 秒才生效的离座规则。
-- 工作日下班后、周末和配置节假日的加班时长。
-- 行为时间轴、历史日报、ROI Web 标定和事件片段。
-- 摄像头、RT-CV、Cosmos3 健康状态和断流恢复。
-- 事件片段保留 7 天，日报数据保留 365 天。
-- 内网 HTTPS 页面，无登录密码。
+- 多人检测、短时跟踪、ReID 人物关联和人物参考图库。
+- 人物改名、停用误检档案，以及手动合并同一人的多个临时身份。
+- 按人物和日期生成连续活动时间线，并将观看屏幕、键盘输入和鼠标操作统一为“使用电脑”。
+- 跨短 tracker 合并同类事件，保留原始子事件供用户展开查看。
+- 基于椅子 ROI 生成离开工位和返回工位事件，解释活动记录中的空白时段。
+- 电脑、阅读、书写、手机、交谈、进食/喝水、休息和其他动作的保守分类。
+- VSS Agent 按人物、日期、活动类型和 `event_id` 查询事件及其姿态、目标物、关键帧证据。
+- MediaPipe 身体/手部关键点独立采集，不依赖 NvDCF `Object.pose` 附着成功。
+- GDINO 检测杯子、瓶子等行为相关物体，辅助短动作候选召回。
+- 数据飞轮候选生成、人物框视频裁剪、在线复核、二次裁剪、人工标签和 JSONL 导出。
+- 训练/验证/测试按原始事件隔离，训练集轻度增强，防止同源视频泄漏。
+- Cosmos3-Nano Reasoner BF16 LoRA SFT、Base/LoRA 成对评估和逐条回归审计。
+- 摄像头、Kafka、RT-CV、MediaPipe、GDINO、Cosmos3 健康状态和断流恢复。
+- 内网 HTTPS 单页界面，所有现场数据、视频、模型和配置保存在本地。
 
-行为分类是视觉模型估计，仅适合个人时间复盘，不应作为员工绩效、考勤处罚或身份判断依据。摄像头、RT-CV 或模型不可用的时间标记为数据缺失，不计入有效在座和专注时长。
+行为分类是视觉模型估计，仅适合技术验证和个人时间复盘，不应作为员工绩效、考勤处罚、身份认证或健康判断依据。摄像头、检测、姿态或模型不可用的时间标记为数据缺失。
 
 ## 环境要求
 
@@ -84,7 +99,7 @@ MOTION_MODELS_AUTO_DOWNLOAD=true
 ./scripts/status.sh
 ```
 
-安装脚本会下载 Cosmos3、BodyPose3DNet 和 MediaPipe Hand Landmarker，启动 VSS、USB 摄像头网关、连续动作 worker、Cosmos3 服务和 Office API，并尝试把 `office-main` 自动注册到 RT-CV。大模型权重保存在 `COSMOS3_MODEL_DIR`，动作模型保存在 `data/models`，停止或重建容器不会重新下载。
+安装脚本会准备 Cosmos3、GDINO 与 MediaPipe 所需资源，启动 VSS、USB 摄像头网关、RT-CV、姿态采集、行为/飞轮 worker、Cosmos3 服务和 Office API，并尝试把 `office-main` 自动注册到 RT-CV。大模型权重保存在 `COSMOS3_MODEL_DIR`，动作模型保存在 `data/models`，停止或重建容器不会重新下载。
 
 ## 已有 Spark 安装更新
 
@@ -164,14 +179,18 @@ docker compose \
 |---|---|
 | `GET /office-api/api/activity/events?date=&person_id=&q=` | 按日期、人员和关键词查询活动事件与统计 |
 | `GET /office-api/api/activity/events?start=&end=` | 按 ISO 日期或时间范围查询活动事件 |
+| `GET /office-api/api/activity/events/{id}` | 读取单个事件、关键帧和判定证据 |
 | `GET /office-api/api/person/activity/today` | 当前人数及今日按人活动概况 |
 | `GET /office-api/api/people` | 已登记人员列表 |
+| `GET /office-api/api/people/{id}/images` | 读取人物参考图库 |
 | `GET /office-api/api/workstation/live` | 当前在座、行为、连续时长和健康状态 |
 | `GET /office-api/api/workstation/reports?start=&end=` | 日期范围日报 |
 | `GET /office-api/api/workstation/reports/{date}` | 某日统计、时间轴和离座记录 |
 | `GET /office-api/api/workstation/frame` | ROI 标定当前帧 |
 | `GET /office-api/api/workstation/roi` | 读取椅子 ROI |
 | `PUT /office-api/api/workstation/roi` | 保存归一化椅子多边形 |
+
+数据飞轮页面还提供候选筛选、视频播放、人工标签、二次裁剪与 JSONL 导出接口；人物管理页面提供改名、停用和合并接口。完整接口与数据约束见项目文档。
 
 ## 安全与隐私
 
@@ -181,7 +200,7 @@ docker compose \
 - 人员参考截图和活动数据库仅保存在本机数据目录；人员名称由管理员在内网页面维护。
 - 模型只允许描述画面可见动作，不读取或猜测屏幕内容、文件名、项目、会议主题或业务目的。
 
-更完整的配置、发布和回滚说明见 [办公助手部署文档](docs/OFFICE_ASSISTANT.md)。
+完整功能介绍、系统架构、数据飞轮、LoRA 实验、部署、隐私边界和后续方向见 [视觉日记完整项目文档](docs/OFFICE_ASSISTANT.md)。训练参数与排障过程见 [工程笔记](docs/OFFICE_ASSISTANT_ENGINEERING_NOTES.md)。
 
 ---
 
